@@ -81,6 +81,9 @@ from .utils import build_model_function
 # invocation `mim -p opt -p clos <file>.mim -p ll`.
 EXEC_PLUGINS = ["opt", "clos", "math", "tensor", "ll"]
 
+MLIR_EXEC_PLUGINS = ["clos", "math", "tensor", "mlir"]
+
+
 def _load_crt() -> ctypes.CDLL:
     """The C runtime providing the `free` that matches the JIT'd code's `malloc`."""
     if platform.system() == "Windows":
@@ -140,10 +143,15 @@ def _loaded_module_paths() -> Iterator[str]:
         handles = (wt.HMODULE * 1024)()
         needed = wt.DWORD()
         if psapi.EnumProcessModules(
-            kernel32.GetCurrentProcess(), handles, ctypes.sizeof(handles), ctypes.byref(needed)
+            kernel32.GetCurrentProcess(),
+            handles,
+            ctypes.sizeof(handles),
+            ctypes.byref(needed),
         ):
             buffer = ctypes.create_unicode_buffer(32768)
-            for i in range(min(needed.value // ctypes.sizeof(wt.HMODULE), len(handles))):
+            for i in range(
+                min(needed.value // ctypes.sizeof(wt.HMODULE), len(handles))
+            ):
                 if kernel32.GetModuleFileNameW(handles[i], buffer, len(buffer)):
                     yield buffer.value
 
@@ -240,11 +248,17 @@ def _cache_store(cache_dir: Path, sources: list[Path]) -> None:
 def _check_tensors(tensors, what: str) -> None:
     for i, t in enumerate(tensors):
         if not isinstance(t, torch.Tensor):
-            raise NotImplementedError(f"mimir backend supports tensor {what} only, {what} {i} is {type(t).__name__}")
+            raise NotImplementedError(
+                f"mimir backend supports tensor {what} only, {what} {i} is {type(t).__name__}"
+            )
         if t.dtype != torch.float32:
-            raise NotImplementedError(f"mimir backend supports float32 only, {what} {i} has dtype {t.dtype}")
+            raise NotImplementedError(
+                f"mimir backend supports float32 only, {what} {i} has dtype {t.dtype}"
+            )
         if t.dim() == 0:
-            raise NotImplementedError(f"mimir backend does not support 0-d tensor {what}s")
+            raise NotImplementedError(
+                f"mimir backend does not support 0-d tensor {what}s"
+            )
 
 
 def _pack_outputs(gm: fx.GraphModule, out_shapes: list[tuple[int, ...]]) -> None:
@@ -271,6 +285,17 @@ def _pack_outputs(gm: fx.GraphModule, out_shapes: list[tuple[int, ...]]) -> None
     gm.recompile()
 
 
+def _emit_mlir(
+    gm: fx.GraphModule, input_shapes: list[tuple[int, ...]], name: str, build_dir: Path
+) -> None:
+    driver = mim.Driver()
+    driver.load_plugins(MLIR_EXEC_PLUGINS)
+    world = driver.world()
+    build_model_function(world, gm, input_shapes, name=name)
+    world.set(name)
+    world.optimize()  # runs mlir.mim's _default_compile, ending in %mlir.emit
+
+
 def mimir_backend(
     gm: fx.GraphModule,
     example_inputs: list[torch.Tensor],
@@ -281,12 +306,19 @@ def mimir_backend(
     opts = dict(options or {})
     debug_dir = opts.pop("debug_dir", None) or os.environ.get("MIMIR_DEBUG_DIR")
     profile = opts.pop("profile", None) or os.environ.get("MIMIR_PROFILE")
+    emit_mlir = opts.pop("emit_mlir", False) or bool(os.environ.get("MIMIR_EMIT_MLIR"))
     cache_enabled = opts.pop("cache", True)
-    cache_dir = Path(opts.pop("cache_dir", None) or os.environ.get("MIMIR_CACHE_DIR") or _default_cache_dir())
+    cache_dir = Path(
+        opts.pop("cache_dir", None)
+        or os.environ.get("MIMIR_CACHE_DIR")
+        or _default_cache_dir()
+    )
     if opts:
         raise TypeError(f"unknown mimir backend options: {sorted(opts)}")
     if profile is not None and profile not in ("summary", "tree", "trace"):
-        raise ValueError(f"profile must be 'summary', 'tree', or 'trace', got {profile!r}")
+        raise ValueError(
+            f"profile must be 'summary', 'tree', or 'trace', got {profile!r}"
+        )
 
     _check_tensors(example_inputs, "input")
     if any(n.op == "get_attr" for n in gm.graph.nodes):
@@ -296,7 +328,9 @@ def mimir_backend(
 
     output_node = next(n for n in gm.graph.nodes if n.op == "output")
     container = output_node.args[0]
-    if not isinstance(container, (tuple, list)) or not all(isinstance(n, fx.Node) for n in container):
+    if not isinstance(container, (tuple, list)) or not all(
+        isinstance(n, fx.Node) for n in container
+    ):
         raise NotImplementedError(f"unsupported output structure: {container!r}")
     restore = type(container)
 
@@ -319,14 +353,23 @@ def mimir_backend(
 
     lib = keep_alive = None
     # debug_dir and profile both require an actual compile to observe.
-    if cache_enabled and not debug_dir and not profile and cached_so.exists():
+    if (
+        cache_enabled
+        and not debug_dir
+        and not profile
+        and not emit_mlir
+        and cached_so.exists()
+    ):
         lib = ctypes.cdll.LoadLibrary(str(cached_so))
 
     if lib is None:
         if debug_dir:
             build_dir = Path(debug_dir)
             build_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[mimir] {name}: keeping compilation artifacts in {build_dir}", file=sys.stderr)
+            print(
+                f"[mimir] {name}: keeping compilation artifacts in {build_dir}",
+                file=sys.stderr,
+            )
         else:
             build_dir = Path(tempfile.mkdtemp(prefix=f"{name}-"))
 
@@ -362,6 +405,9 @@ def mimir_backend(
                 # Resolve while still chdir'd: on POSIX the JIT builds
                 # `./<name>.so` in cwd, on Windows a DLL in a temp dir.
                 built_lib = Path(jit._get_so_path()).resolve()
+                if emit_mlir:
+                    # Separate Driver/World — see MLIR_EXEC_PLUGINS comment.
+                    _emit_mlir(gm, input_shapes, name, build_dir)
             finally:
                 os.chdir(old_cwd)
 
@@ -373,14 +419,27 @@ def mimir_backend(
             }[profile]()
             if profile == "trace" or debug_dir:
                 # chrome://tracing JSON (and anything under debug_dir) goes to a file.
-                dest = build_dir / f"{name}_profile.{'json' if profile == 'trace' else 'txt'}"
+                dest = (
+                    build_dir
+                    / f"{name}_profile.{'json' if profile == 'trace' else 'txt'}"
+                )
                 dest.write_text(report)
-                print(f"[mimir] {name}: phase profile written to {dest}", file=sys.stderr)
+                print(
+                    f"[mimir] {name}: phase profile written to {dest}", file=sys.stderr
+                )
             else:
                 print(f"[mimir] {name}: phase profile\n{report}", file=sys.stderr)
 
         if cache_enabled:
-            _cache_store(cache_dir, [built_lib, build_dir / f"{name}.ll"])
+            sources = [built_lib, build_dir / f"{name}.ll"]
+            if emit_mlir:
+                sources.append(build_dir / f"{name}.mlir")
+            _cache_store(cache_dir, sources)
+        if emit_mlir and debug_dir:
+            print(
+                f"[mimir] {name}: mlir emitted to {build_dir / f'{name}.mlir'}",
+                file=sys.stderr,
+            )
         # Keep the driver/world alive as long as the callable.
         keep_alive = driver
 
@@ -392,7 +451,9 @@ def mimir_backend(
         # Keep the contiguous buffers referenced until the call returns.
         buffers = [a.detach().contiguous() for a in args]
         out_ptr = fn(*[b.data_ptr() for b in buffers])
-        array = ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_float * total_numel)).contents
+        array = ctypes.cast(
+            out_ptr, ctypes.POINTER(ctypes.c_float * total_numel)
+        ).contents
         flat = torch.frombuffer(array, dtype=torch.float32).clone()
         _LIBC.free(ctypes.cast(out_ptr, ctypes.c_void_p))
         # The outputs are disjoint views of one flat buffer.

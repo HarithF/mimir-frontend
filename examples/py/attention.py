@@ -13,7 +13,13 @@ class TinyAttention(torch.nn.Module):
         self.wv = torch.nn.Parameter(torch.randn(8, 8))
         self.wo = torch.nn.Parameter(torch.randn(8, 8))
 
-    @torch.compile(backend="mimir", options={"debug_dir": f"{os.path.dirname(os.path.realpath(__file__))}/../mim_debug"})
+    @torch.compile(
+        backend="mimir",
+        options={
+            "debug_dir": f"{os.path.dirname(os.path.realpath(__file__))}/../mim_debug",
+            "emit_mlir": True,
+        },
+    )
     def forward(self, x):
         q = torch.ops.aten.mm.default(x, self.wq)
         k = torch.ops.aten.mm.default(x, self.wk)
