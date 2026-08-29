@@ -43,11 +43,22 @@ def parse_args() -> argparse.Namespace:
         help="Override the compile phase declared by each model.",
     )
     parser.add_argument("--max-depth", type=int, default=100)
+    parser.add_argument(
+        "--fast-math",
+        help="FP relaxation mode for the emitted %%math ops: 'fast', 'none', or a "
+        "flag list like 'contract|reassoc'. Defaults to MIMIR_FAST_MATH, else 'fast'.",
+    )
     parser.add_argument("--keep-going", action="store_true", help="Continue exporting other models after a failure.")
     return parser.parse_args()
 
 
-def export_one(path: Path, out_dir: Path, compile_phase: str | None, max_depth: int) -> Path:
+def export_one(
+    path: Path,
+    out_dir: Path,
+    compile_phase: str | None,
+    max_depth: int,
+    fast_math: str | None = None,
+) -> Path:
     module = load_python_module(path)
     spec = export_spec_from_module(module)
     ir = model_to_mimir(
@@ -56,6 +67,7 @@ def export_one(path: Path, out_dir: Path, compile_phase: str | None, max_depth: 
         compile_phase=compile_phase or spec.compile_phase,
         name=spec.name,
         max_depth=max_depth,
+        math_mode=fast_math,
     )
 
     out_path = out_dir / f"{spec.name}.mim"
@@ -74,7 +86,9 @@ def main() -> int:
     failures = []
     for path in files:
         try:
-            out_path = export_one(path, args.out_dir, args.compile_phase, args.max_depth)
+            out_path = export_one(
+                path, args.out_dir, args.compile_phase, args.max_depth, args.fast_math
+            )
             print(f"{path} -> {out_path}")
         except Exception as exc:
             failures.append((path, exc))

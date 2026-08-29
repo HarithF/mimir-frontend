@@ -11,6 +11,7 @@ import torch
 from torch import fx
 from mim._plugins.compile import compile as mim_compile
 
+from .fastmath import Mode
 from .translator import FXGraphTranslator
 
 
@@ -257,11 +258,14 @@ def build_model_function(
     input_shapes: Sequence[Shape] | None,
     *,
     name: str = "mimir_module",
+    math_mode: Mode | bool | int | str | None = None,
 ) -> mim.Def:
     """Translate a torch FX model into an externalized MimIR function in `world`.
 
     `input_shapes` can contain `None` or `str` for dynamic/symbolic dimensions.
     Module parameters (get_attr nodes) are appended as trailing function arguments.
+    `math_mode` selects the FP relaxations every emitted `%math` op carries
+    (see `mimir_frontend.fastmath`); `None` uses `fastmath.default_mode()`.
     """
     if isinstance(model, fx.GraphModule):
         traced = model
@@ -277,7 +281,7 @@ def build_model_function(
     param_nodes = [node for node in graph.nodes if node.op == "get_attr"]
     param_names = [node.target for node in param_nodes]
     
-    translator = FXGraphTranslator(world, module=traced)
+    translator = FXGraphTranslator(world, module=traced, math_mode=math_mode)
     ops = translator.ops
     
     shape_env = ShapeEnv(world)
@@ -333,6 +337,7 @@ def model_to_mimir(
     compile_phase: str = "high_level",
     name: str = "mimir_module",
     max_depth: int = 100,
+    math_mode: Mode | bool | int | str | None = None,
 ) -> str:
     """Translate a torch FX model to a closed MimIR module function.
 
@@ -346,7 +351,9 @@ def model_to_mimir(
     driver = _make_driver(compile_phase)
     world = driver.world()
 
-    result_lam = build_model_function(world, model, input_shapes, name=name)
+    result_lam = build_model_function(
+        world, model, input_shapes, name=name, math_mode=math_mode
+    )
 
     if compile_phase == "default":
         compile_lam = _define_compile_lam(world, _default_compile_phase(world))

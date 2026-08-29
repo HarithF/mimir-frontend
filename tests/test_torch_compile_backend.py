@@ -182,3 +182,65 @@ def test_debug_dir_dumps_artifacts(tmp_path):
     for suffix in ("_pre.mim", "_post.mim", ".ll", ".so"):
         matches = list(tmp_path.glob(f"mimir_graph_*{suffix}"))
         assert matches, f"expected a mimir_graph_*{suffix} artifact in {tmp_path}"
+
+
+def _emitted_fp_ops(tmp_path):
+    """The distinct `fadd`/`fmul`/... forms in the .ll dumped under `tmp_path`."""
+    import re
+
+    ll = next(iter(tmp_path.glob("mimir_graph_*.ll"))).read_text()
+    return set(re.findall(r"^\s*%\S+ = (f(?:add|sub|mul|div)[a-z ]*) float", ll, re.M))
+
+
+def _compile_with(model, x, tmp_path, **options):
+    with torch.no_grad():
+        compiled = torch.compile(
+            model,
+            backend="mimir",
+            options={"debug_dir": str(tmp_path), "cache_dir": str(tmp_path), **options},
+        )
+        torch.testing.assert_close(compiled(x), model(x), rtol=1e-4, atol=1e-4)
+
+
+def test_fast_math_is_on_by_default(tmp_path):
+    _compile_with(LinearMLP(), torch.randn(4, 16), tmp_path)
+    assert _emitted_fp_ops(tmp_path) == {"fadd fast", "fmul fast"}
+
+
+def test_fast_math_can_be_disabled(tmp_path):
+    _compile_with(LinearMLP(), torch.randn(4, 16), tmp_path, fast_math=False)
+    assert _emitted_fp_ops(tmp_path) == {"fadd", "fmul"}
+
+
+def test_fast_math_accepts_individual_flags(tmp_path):
+    _compile_with(LinearMLP(), torch.randn(4, 16), tmp_path, fast_math="contract|reassoc")
+    assert _emitted_fp_ops(tmp_path) == {"fadd contract reassoc", "fmul contract reassoc"}
+
+
+def test_fast_math_follows_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_FAST_MATH", "nnan|contract")
+    _compile_with(LinearMLP(), torch.randn(4, 16), tmp_path)
+    assert _emitted_fp_ops(tmp_path) == {"fadd nnan contract", "fmul nnan contract"}
+
+
+def test_fast_math_rejects_unknown_flag():
+    # Dynamo re-raises a backend failure as BackendCompilerFailed, keeping the message.
+    with pytest.raises(torch._dynamo.exc.BackendCompilerFailed, match="unknown fast-math flag"):
+        with torch.no_grad():
+            torch.compile(LinearMLP(), backend="mimir", options={"fast_math": "bogus"})(
+                torch.randn(4, 16)
+            )
+
+
+def test_fast_math_separates_cache_entries(tmp_path):
+    """The same graph at two modes must not share one cached library."""
+    model, x = LinearMLP(), torch.randn(4, 16)
+    with torch.no_grad():
+        for fast_math in (True, False):
+            torch._dynamo.reset()
+            compiled = torch.compile(
+                model, backend="mimir", options={"cache_dir": str(tmp_path), "fast_math": fast_math}
+            )
+            torch.testing.assert_close(compiled(x), model(x), rtol=1e-4, atol=1e-4)
+
+    assert len({p.name for p in tmp_path.glob("*.so")}) == 2

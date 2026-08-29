@@ -1,6 +1,7 @@
 import torch
 from torch import fx
 import mim
+from .fastmath import Mode
 from .operators import OperatorLibrary
 from mim._plugins.compile import compile as mim_compile
 import operator
@@ -9,10 +10,16 @@ from collections.abc import Callable
 import builtins
 
 class FXGraphTranslator:
-    def __init__(self, world: mim.World, module: torch.nn.Module = None):
+    def __init__(
+        self,
+        world: mim.World,
+        module: torch.nn.Module = None,
+        *,
+        math_mode: Mode | bool | int | str | None = None,
+    ):
         self.world = world
         self.module = module
-        self.ops = OperatorLibrary(world)
+        self.ops = OperatorLibrary(world, math_mode=math_mode)
         self.env: dict[fx.Node, mim.Def] = {}
         self.convert_map: dict[str | Callable, Callable[[fx.Node], mim.Def]] = self.create_convert_map()
 

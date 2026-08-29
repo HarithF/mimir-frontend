@@ -28,6 +28,14 @@ compilation artifacts in that directory, including a dump of the MimIR world
 before (`<name>_pre.mim`) and after (`<name>_post.mim`) `world.optimize()`,
 alongside the emitted `<name>.ll` and `<name>.so`.
 
+Fast math: every emitted ``%math`` op carries a relaxation mode that MimIR's
+``ll`` backend turns into LLVM fast-math flags (``fadd fast float`` instead of
+``fadd float``), and that MimIR's math normalizers use to enable algebraic
+identities. It defaults to the full ``Mode.fast`` set; pass
+``options={"fast_math": False}`` for strict IEEE semantics, or a finer selection
+such as ``options={"fast_math": "contract|reassoc"}``. The ``MIMIR_FAST_MATH``
+environment variable sets the default for a whole process.
+
 Profiling: pass ``options={"profile": "summary" | "tree" | "trace"}`` (or set
 ``MIMIR_PROFILE``) to record MimIR phase runtimes during `world.optimize()`.
 `summary` and `tree` print to stderr (or to `<name>_profile.txt` under a
@@ -38,10 +46,10 @@ Profiling (like `debug_dir`) forces a fresh compile instead of a cache hit.
 Caching: compiled `.so` files are reused across processes from
 ``~/.cache/mimir-frontend/jit`` (override with ``options={"cache_dir": ...}``
 or ``MIMIR_CACHE_DIR``; disable with ``options={"cache": False}``). The cache
-key hashes the canonicalized FX graph and input shapes together with a
-fingerprint of the MimIR installation (bindings, libmim, the loaded plugins,
-and clang), so rebuilding MimIR invalidates stale entries. Parameter *values*
-are runtime arguments and deliberately not part of the key. A `debug_dir`
+key hashes the canonicalized FX graph, the input shapes, and the fast-math
+mode together with a fingerprint of the MimIR installation (bindings, libmim,
+the loaded plugins, and clang), so rebuilding MimIR invalidates stale entries.
+Parameter *values* are runtime arguments and deliberately not part of the key. A `debug_dir`
 request always recompiles (to produce the dumps) but still refreshes the cache.
 
 Current limitations: float32 tensors only, static shapes, inference only (the
@@ -74,6 +82,7 @@ import mim
 import torch
 from torch import fx
 
+from .fastmath import Mode, mode_name, parse_mode
 from .utils import build_model_function
 
 # `opt` supplies the default compile pipeline (incl. %tensor.lower_to_mem
@@ -208,12 +217,15 @@ def _target_repr(target) -> str:
     return str(target)
 
 
-def _cache_key(gm: fx.GraphModule, input_shapes) -> str:
+def _cache_key(gm: fx.GraphModule, input_shapes, math_mode: Mode) -> str:
     hasher = hashlib.sha256(_mim_fingerprint().encode())
     for node in gm.graph.nodes:
         args = fx.node.map_arg((node.args, node.kwargs), lambda n: f"%{n.name}")
         hasher.update(f"{node.op}|{_target_repr(node.target)}|{args!r}\n".encode())
     hasher.update(repr(input_shapes).encode())
+    # Two libraries built from the same graph but different FP relaxations are
+    # not interchangeable, so the mode has to separate their cache entries.
+    hasher.update(f"|fast_math={int(math_mode)}".encode())
     return hasher.hexdigest()[:16]
 
 
@@ -286,12 +298,16 @@ def _pack_outputs(gm: fx.GraphModule, out_shapes: list[tuple[int, ...]]) -> None
 
 
 def _emit_mlir(
-    gm: fx.GraphModule, input_shapes: list[tuple[int, ...]], name: str, build_dir: Path
+    gm: fx.GraphModule,
+    input_shapes: list[tuple[int, ...]],
+    name: str,
+    build_dir: Path,
+    math_mode: Mode,
 ) -> None:
     driver = mim.Driver()
     driver.load_plugins(MLIR_EXEC_PLUGINS)
     world = driver.world()
-    build_model_function(world, gm, input_shapes, name=name)
+    build_model_function(world, gm, input_shapes, name=name, math_mode=math_mode)
     world.set(name)
     world.optimize()  # runs mlir.mim's _default_compile, ending in %mlir.emit
 
@@ -307,6 +323,9 @@ def mimir_backend(
     debug_dir = opts.pop("debug_dir", None) or os.environ.get("MIMIR_DEBUG_DIR")
     profile = opts.pop("profile", None) or os.environ.get("MIMIR_PROFILE")
     emit_mlir = opts.pop("emit_mlir", False) or bool(os.environ.get("MIMIR_EMIT_MLIR"))
+    # None (unset) defers to MIMIR_FAST_MATH and then fastmath.DEFAULT_MODE;
+    # an explicit False must stay False, so this cannot use the `or env` idiom.
+    math_mode = parse_mode(opts.pop("fast_math", None))
     cache_enabled = opts.pop("cache", True)
     cache_dir = Path(
         opts.pop("cache_dir", None)
@@ -346,9 +365,10 @@ def mimir_backend(
 
     _pack_outputs(gm, out_shapes)
 
-    # The key covers the packed graph, input shapes, and the MimIR install;
-    # it also names the exported symbol, so cached libraries are self-contained.
-    name = f"mimir_graph_{_cache_key(gm, input_shapes)}"
+    # The key covers the packed graph, input shapes, fast-math mode, and the
+    # MimIR install; it also names the exported symbol, so cached libraries are
+    # self-contained.
+    name = f"mimir_graph_{_cache_key(gm, input_shapes, math_mode)}"
     cached_so = cache_dir / f"{name}{_shared_lib_suffix()}"
 
     lib = keep_alive = None
@@ -367,7 +387,8 @@ def mimir_backend(
             build_dir = Path(debug_dir)
             build_dir.mkdir(parents=True, exist_ok=True)
             print(
-                f"[mimir] {name}: keeping compilation artifacts in {build_dir}",
+                f"[mimir] {name}: keeping compilation artifacts in {build_dir} "
+                f"(fast_math={mode_name(math_mode)})",
                 file=sys.stderr,
             )
         else:
@@ -384,7 +405,7 @@ def mimir_backend(
                 "trace": mim.Flags.Profile.Trace,
             }[profile]
 
-        build_model_function(world, gm, input_shapes, name=name)
+        build_model_function(world, gm, input_shapes, name=name, math_mode=math_mode)
 
         with _compile_lock:
             old_cwd = os.getcwd()
@@ -407,7 +428,7 @@ def mimir_backend(
                 built_lib = Path(jit._get_so_path()).resolve()
                 if emit_mlir:
                     # Separate Driver/World — see MLIR_EXEC_PLUGINS comment.
-                    _emit_mlir(gm, input_shapes, name, build_dir)
+                    _emit_mlir(gm, input_shapes, name, build_dir, math_mode)
             finally:
                 os.chdir(old_cwd)
 

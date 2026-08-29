@@ -54,12 +54,43 @@ compiled = torch.compile(model, backend="mimir")
 # MimIR dumps and the emitted .ll/.so per compiled graph
 # pass options={"profile": "summary" | "tree" | "trace"} (or set MIMIR_PROFILE)
 # to report MimIR phase runtimes; "trace" writes chrome://tracing JSON
+# pass options={"fast_math": False} for strict IEEE floating point
 ```
 
+### Fast math
+
+Every `%math` op the frontend emits carries a relaxation mode (MimIR's
+`mim::plug::math::Mode`). MimIR's `ll` backend turns it into the LLVM
+fast-math flags, and MimIR's own math normalizers use it to decide which
+algebraic identities they may apply. The frontend defaults to the full
+`Mode.fast` set, so the emitted IR reads
+
+```llvm
+%3 = fmul fast float %1, %2
+%4 = fadd fast float %3, %bias
+```
+
+instead of the bare `fmul float` / `fadd float` you get with `Mode.none`.
+Select a different mode with `options={"fast_math": ...}`, the
+`MIMIR_FAST_MATH` environment variable, or `--fast-math` on
+`scripts/export_models_to_mimir.py`. All three accept:
+
+| Value | Meaning |
+| --- | --- |
+| `True` / `"fast"` / `"on"` | all relaxations (the default) |
+| `False` / `"none"` / `"off"` / `"strict"` | strict IEEE, no flags emitted |
+| `"contract\|reassoc"`, `"nnan, ninf"` | any `\|`/`,`-separated list of flags |
+| `"finite"`, `"unsafe"` | the `nnan\|ninf` and `nsz\|arcp\|reassoc` groups |
+| an `int`, e.g. `16` | a raw mode bit set |
+
+Individual flags are `nnan`, `ninf`, `nsz`, `arcp`, `contract`, `afn`, and
+`reassoc`; see `src/mimir_frontend/fastmath.py`.
+
 Compiled graphs are cached in `~/.cache/mimir-frontend/jit` keyed by the FX
-graph, input shapes, and a fingerprint of the MimIR installation (rebuilding
-MimIR invalidates the cache). Override the location with `MIMIR_CACHE_DIR` or
-`options={"cache_dir": ...}`; disable with `options={"cache": False}`.
+graph, input shapes, the fast-math mode, and a fingerprint of the MimIR
+installation (rebuilding MimIR invalidates the cache). Override the location
+with `MIMIR_CACHE_DIR` or `options={"cache_dir": ...}`; disable with
+`options={"cache": False}`.
 
 ## Running Tests
 

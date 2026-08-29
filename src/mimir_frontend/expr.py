@@ -2,6 +2,8 @@ import mim
 from mim._plugins.core import core
 from mim._plugins.math import math
 
+from .fastmath import default_mode
+
 def _is_nat(world, t):
     return t == world.type_nat()
 
@@ -54,7 +56,7 @@ def bin(op_name, lhs, rhs):
     
     if _is_f32(world, t_lhs) and _is_f32(world, t_rhs):
         f32_config = world.annex(math.f32.value)
-        mode0 = world.lit_nat_0()
+        mode = world.lit_nat(int(default_mode()))
         
         if op_name == "add":
             axm = world.annex(math.arith.add.value)
@@ -67,7 +69,7 @@ def bin(op_name, lhs, rhs):
         else:
             return NotImplemented
             
-        callee = world.app(world.app(axm, f32_config), mode0)
+        callee = world.app(world.app(axm, f32_config), mode)
         return world.app(callee, [lhs_def, rhs_def])
 
     return NotImplemented

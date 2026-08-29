@@ -5,17 +5,22 @@ from mim._plugins.math import math, _math_arith, _math_extrema, _math_cmp, _math
 from mim._plugins.tensor import tensor
 from mim._plugins.core import core, _core_bit1, _core_bit2
 
+from .fastmath import Mode, parse_mode
 from .shape_rules import ShapeRules
 from . import expr
 
 class OperatorLibrary:
-    def __init__(self, world: mim.World):
+    def __init__(self, world: mim.World, *, math_mode: Mode | bool | int | str | None = None):
         self.world = world
         self.rules = ShapeRules(world)
         self.f32_config = world.annex(math.f32.value)
         self.F32 = world.annex(math.F32.value)
         self.Bool = world.type_bool()
-        self.mode0 = world.lit_nat_0()
+        # Relaxations every %math op is allowed to take. The `ll` backend turns
+        # these bits into the LLVM fast-math flags on fadd/fmul/... , and MimIR's
+        # own math normalizers key their algebraic identities off them.
+        self.math_mode = parse_mode(math_mode)
+        self.math_mode_lit = world.lit_nat(int(self.math_mode))
         self.sym_map = {} # Mapping from symbolic name to MimIR Nat variable
         self._shape_cache: dict[mim.Def, list[mim.Def]] = {}
 
@@ -24,7 +29,7 @@ class OperatorLibrary:
             axm = world.annex(axm_enum.value)
             # %_math_arith.add {pe} mode
             axm = world.app(axm, self.f32_config)
-            return world.app(axm, self.mode0)
+            return world.app(axm, self.math_mode_lit)
 
         # Arithmetic
         self.f32_add_axm = bind_math_axm(_math_arith.add)
@@ -60,7 +65,7 @@ class OperatorLibrary:
 
         # Bitwise/Logical
         s_bool = world.lit_nat(2)
-        m_scalar = world.lit_nat_0()
+        m_scalar = world.lit_nat_0()  # %core.bit mode, unrelated to %math's
         
         def bind_bit_axm(axm_enum):
             axm = world.annex(axm_enum.value)

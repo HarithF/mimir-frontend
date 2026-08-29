@@ -9,6 +9,7 @@ from typing import Sequence
 
 import torch
 
+from .fastmath import Mode
 from .utils import Shape, model_to_mimir
 
 
@@ -41,12 +42,14 @@ def run_spec_with_mimir(
     rtol: float = 1e-4,
     atol: float = 1e-4,
     debug_dir: str | Path | None = None,
+    fast_math: Mode | bool | int | str | None = None,
 ) -> float:
     """JIT `spec.model` through the "mimir" torch.compile backend and check it against eager.
 
     Draws random inputs from `spec.input_shapes` (which must be fully static),
     prints a result line, and returns the maximum absolute error. Pass `debug_dir`
-    to keep the compilation artifacts (pre/post-optimize .mim dumps, .ll, .so).
+    to keep the compilation artifacts (pre/post-optimize .mim dumps, .ll, .so),
+    and `fast_math` to override the FP relaxations (see `mimir_frontend.fastmath`).
     """
     import mimir_frontend.backend  # noqa: F401 - registers the "mimir" backend
 
@@ -55,10 +58,14 @@ def run_spec_with_mimir(
             raise ValueError(f"{spec.name}: symbolic input dims {tuple(shape)} are not supported by the JIT flow")
     inputs = [torch.randn(*shape) for shape in spec.input_shapes]
 
-    options = {"debug_dir": str(debug_dir)} if debug_dir else None
+    options = {}
+    if debug_dir:
+        options["debug_dir"] = str(debug_dir)
+    if fast_math is not None:
+        options["fast_math"] = fast_math
     with torch.no_grad():
         want = spec.model(*inputs)
-        got = torch.compile(spec.model, backend="mimir", options=options)(*inputs)
+        got = torch.compile(spec.model, backend="mimir", options=options or None)(*inputs)
 
     torch.testing.assert_close(got, want, rtol=rtol, atol=atol)
     pairs = zip(got, want) if isinstance(want, (tuple, list)) else [(got, want)]
