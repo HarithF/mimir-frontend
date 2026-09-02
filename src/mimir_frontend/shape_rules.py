@@ -26,7 +26,9 @@ class ShapeRules:
         return None
 
     def _is_dim_one(self, dim: mim.Def):
-        return self._dim_literal_value(dim) == 1
+        # Compare against the literal rather than reading a value out of it: the
+        # binding gives Lit no accessor, but the World is hash-consed.
+        return dim == self.world.lit_nat(1)
 
     def _same_dim(self, lhs: mim.Def, rhs: mim.Def):
         lhs_value = self._dim_literal_value(lhs)

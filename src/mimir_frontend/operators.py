@@ -61,7 +61,7 @@ class OperatorLibrary:
         # Complex
         self.f32_sigmoid_axm = bind_math_axm(math.slf)
         self.f32_rsqrt_axm = bind_math_axm(math.rrt)
-        self.affine_index = world.annex(affine.index.value)
+        self.affine_index = world.annex(affine.Idx.value)
 
         # Bitwise/Logical
         s_bool = world.lit_nat(2)
@@ -149,7 +149,9 @@ class OperatorLibrary:
         return dims
 
     def _is_lit_nat_value(self, value, expected: int) -> bool:
-        return isinstance(value, mim.Lit) and value.get_nat() == expected
+        # Lit exposes no value accessor; the World is hash-consed, so an identical
+        # literal compares equal.
+        return isinstance(value, mim.Lit) and value == self.world.lit_nat(expected)
 
     def _apply_grouped(self, callee, args):
         return self.world.app(callee, self.world.tuple(args))
@@ -159,7 +161,7 @@ class OperatorLibrary:
         out_type = self.world.arr(self.world.lit_nat(output_rank), self.affine_index)
         lam = self.world.mut_lam(vec_type, out_type)
         iters = lam.var()
-        lam.set_body(True, self.world.tuple([iters.proj(total_rank, index) for index in projections]))
+        lam.set([self.world.lit_tt(), self.world.tuple([iters.proj(total_rank, index) for index in projections])])
         return lam
 
     def _f32_reduce_lambda(self, op):
@@ -174,7 +176,7 @@ class OperatorLibrary:
         args_type = self.world.arr(self.world.lit_nat(2), arg_type)
         lam = self.world.mut_lam(args_type, ret_type)
         args = lam.var()
-        lam.set_body(True, self.world.app(op, [args.proj(2, 0), args.proj(2, 1)]))
+        lam.set([self.world.lit_tt(), self.world.app(op, [args.proj(2, 0), args.proj(2, 1)])])
         return lam
 
     def _tensor_element_type(self, tensor_def):
@@ -267,7 +269,7 @@ class OperatorLibrary:
     def _f32_pair_to_mean_lambda(self, pair_type):
         lam = self.world.mut_lam(pair_type, self.F32)
         pair = lam.var()
-        lam.set_body(True, self.world.app(self.f32_div_axm, [pair.proj(2, 0), pair.proj(2, 1)]))
+        lam.set([self.world.lit_tt(), self.world.app(self.f32_div_axm, [pair.proj(2, 0), pair.proj(2, 1)])])
         return lam
 
     # Arithmetic
@@ -368,7 +370,7 @@ class OperatorLibrary:
             callee = self.world.annex(core.select.value)
             callee = self.world.app(callee, self.F32)
             res = self._apply_grouped(callee, [v, self._f32_float_lit(1.0), self._f32_float_lit(0.0)])
-            lam.set_body(True, res)
+            lam.set([self.world.lit_tt(), res])
             return self.unary(lam, x, out_type=self.F32)
             
         if in_type == self.F32 and out_type == self.Bool:
@@ -455,7 +457,7 @@ class OperatorLibrary:
             callee = self.world.annex(tensor.map.value)
             callee = self._apply_grouped(callee, [elem_type, self.world.lit_nat(0), self.world.tuple([])])
             lam = self.world.mut_lam(self.world.sigma([]), elem_type)
-            lam.set_body(True, input)
+            lam.set([self.world.lit_tt(), input])
             callee = self.world.app(callee, lam)
             callee = self.world.app(callee, self.world.tuple([out_rank, out_shape_tuple]))
             result = self.world.app(callee, self.world.tuple([]))
@@ -502,7 +504,7 @@ class OperatorLibrary:
         callee = self.world.app(callee, self.world.tuple([elem_type, ni, Is]))
         
         lam = self.world.mut_lam(self.world.sigma([]), elem_type)
-        lam.set_body(True, scalar_def)
+        lam.set([self.world.lit_tt(), scalar_def])
         
         callee = self.world.app(callee, lam)
         callee = self.world.app(callee, self.world.tuple([out_rank, out_shape_tuple]))
@@ -526,7 +528,7 @@ class OperatorLibrary:
 
         callee = self.world.annex(tensor.map_reduce.value)
         callee = self.world.app(callee, self.world.lit_nat(1)) # nis = 1 input tensor
-        callee = self._apply_grouped(callee, [output_type, self.world.lit_nat(output_rank), self.world.lit_nat(reduce_rank)])
+        callee = self._apply_grouped(callee, [output_type, self.world.lit_nat(output_rank), self.world.lit_nat(total_rank)])
         callee = self._apply_grouped(callee, [self.world.tuple(spec.output_dims), self.world.tuple(spec.loop_dims)])
         
         in_elem_type = self._tensor_element_type(input)
@@ -647,9 +649,9 @@ class OperatorLibrary:
             mean_sq = self.world.app(self.f32_mul_axm, [mean, mean])
             e_x_sq = self.world.app(self.f32_div_axm, [s_sq, c])
             var = self.world.app(self.f32_sub_axm, [e_x_sq, mean_sq])
-            lam.set_body(True, var)
+            lam.set([self.world.lit_tt(), var])
         else:
-            lam.set_body(True, mean)
+            lam.set([self.world.lit_tt(), mean])
             
         return lam
 
@@ -1087,9 +1089,12 @@ class OperatorLibrary:
         idx_t = self.world.type_idx(rank_val)
         perm_mim = self.world.tuple([self.world.lit(idx_t, p) for p in permutation])
         
+        # {T, r} -> [permutation] -> {s} -> [input]
         callee = self.world.annex(tensor.transpose.value)
-        callee = self._apply_grouped(callee, [elem_t, rank_val, in_shape_tuple])
-        result = self.world.app(callee, [x, perm_mim])
+        callee = self._apply_grouped(callee, [elem_t, rank_val])
+        callee = self.world.app(callee, perm_mim)
+        callee = self.world.app(callee, in_shape_tuple)
+        result = self.world.app(callee, x)
         return self._remember_shape(result, out_dims)
 
     def _is_one(self, d):
