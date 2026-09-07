@@ -1,6 +1,6 @@
 import mim
 import struct
-from mim._plugins.affine import affine
+from mim._plugins.affine import affine, _affine_op, _affine_semiop
 from mim._plugins.math import math, _math_arith, _math_extrema, _math_cmp, _math_exp, _math_tri, _math_rt
 from mim._plugins.tensor import tensor
 from mim._plugins.core import core, _core_bit1, _core_bit2
@@ -966,53 +966,129 @@ class OperatorLibrary:
         if isinstance(groups, int): return groups == 1
         return self._is_lit_nat_value(groups, 1)
 
-    def _slice_dim(self, x, dim, start, length):
-        """`%tensor.slice` along one axis with `Nat` bounds; `slice` needs Python ints."""
+    def _pad_spatial(self, x, padding):
+        """Zero-pads the spatial axes of an NCHW tensor, so the windowed read stays a pure affine map."""
         rank, in_shape_tuple = self._rank_and_shape(x)
         in_dims = self.shape_of(x)
-        zero, one = self.world.lit_nat(0), self.world.lit_nat(1)
+        zero = self.world.lit_nat(0)
+        lohi = self.world.tuple([zero, zero, self._to_nat(padding[0]), self._to_nat(padding[1])])
 
-        starts, steps = [zero] * len(in_dims), [one] * len(in_dims)
-        starts[dim] = self._to_nat(start)
-        out_dims = list(in_dims)
-        out_dims[dim] = self._to_nat(length)
+        # `%tensor.pad`'s `pad_shape` is `(lo + s) + hi`; matching it keeps the extents structurally equal.
+        def grown(axis, amount):
+            return self._nat_binop(
+                core.nat.add, self._nat_binop(core.nat.add, amount, in_dims[axis]), amount
+            )
 
-        callee = self.world.annex(tensor.slice.value)
+        out_dims = [in_dims[0], in_dims[1], grown(2, padding[0]), grown(3, padding[1])]
+
+        callee = self.world.annex(tensor.pad.value)
         callee = self._apply_grouped(callee, [self._tensor_element_type(x), rank])
         callee = self.world.app(callee, in_shape_tuple)
+        callee = self.world.app(callee, self.world.tuple([zero, lohi, lohi]))
+        return self._remember_shape(self.world.app(callee, [x, self._f32_float_lit(0.0)]), out_dims)
+
+    def _conv_mac_lambda(self):
+        """`(acc, (a, b)) ↦ acc + a·b`, the convolution reduction's multiply-accumulate."""
+        pair = self.world.arr(self.world.lit_nat(2), self.F32)
+        args = self.world.sigma([self.F32, pair])
+        lam = self.world.mut_con([args, self.world.cn([self.F32])])
+        acc, ab = lam.var(0).proj(2, 0), lam.var(0).proj(2, 1)
+        product = self.world.app(self.f32_mul_axm, [ab.proj(2, 0), ab.proj(2, 1)])
+        lam.app(True, lam.ret_var(), [self.world.app(self.f32_add_axm, [acc, product])])
+        return lam
+
+    def _grouped_conv_in_map(self, cin_per, cout_per, stride, dilation):
+        """`(n, co, oh, ow, ci, kh, kw)` ↦ the padded-input read
+        `(n, (co floordiv cout_per)·cin_per + ci, oh·sh + kh·dh, ow·sw + kw·dw)`.
+
+        Recovering the group from the output channel is what lets all `groups` convolutions share one
+        loop nest; a depthwise conv has both factors 1, so the channel read folds back to a projection."""
+        add = self.world.annex(_affine_op.add.value)
+        mul = self.world.annex(_affine_semiop.mul.value)
+        floordiv = self.world.annex(_affine_semiop.floordiv.value)
+
+        lam = self.world.mut_lam(
+            self.world.arr(self.world.lit_nat(7), self.affine_index),
+            self.world.arr(self.world.lit_nat(4), self.affine_index),
+        )
+        o = lam.var()
+
+        def scaled(index, factor):
+            return self.world.app(mul, [o.proj(7, index), self._to_nat(factor)])
+
+        group = self.world.app(floordiv, [o.proj(7, 1), self._to_nat(cout_per)])
+        channel = self.world.app(
+            add, [self.world.app(mul, [group, self._to_nat(cin_per)]), o.proj(7, 4)]
+        )
+        row = self.world.app(add, [scaled(2, stride[0]), scaled(5, dilation[0])])
+        col = self.world.app(add, [scaled(3, stride[1]), scaled(6, dilation[1])])
+
+        lam.set([self.world.lit_tt(), self.world.tuple([o.proj(7, 0), channel, row, col])])
+        return lam
+
+    def _grouped_convolution(self, x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        """Grouped conv as a single `%tensor.map_reduce` over `(n, co, oh, ow, ci, kh, kw)`, whose
+        input read map derives the group from the output channel; `%tensor.conv` covers `groups = 1` only."""
+        in_dims = self.shape_of(x)
+        weight_dims = self.shape_of(weight)
+        if len(in_dims) != 4 or len(weight_dims) != 4:
+            raise NotImplementedError("grouped aten.convolution currently supports 4D NCHW inputs only")
+
+        stride = self._pair(stride, "stride")
+        padding = self._pair(padding, "padding")
+        dilation = self._pair(dilation, "dilation")
+
+        n, _cin, h, w = in_dims
+        cout, cin_per, kh, kw = weight_dims
+        cout_per = self.nat_floordiv(cout, groups)
+        oh, ow = self._conv2d_spatial_shape((h, w), (kh, kw), stride, dilation, padding)
+        out_dims = [n, cout, oh, ow]
+
+        padded = self._pad_spatial(x, padding)
+        rank_4 = self.world.lit_nat(4)
+
+        callee = self.world.annex(tensor.map_reduce.value)
+        callee = self.world.app(callee, self.world.lit_nat(2))
+        callee = self._apply_grouped(callee, [self.F32, rank_4, self.world.lit_nat(7)])
+        callee = self._apply_grouped(
+            callee,
+            [
+                self.world.tuple(out_dims),
+                self.world.tuple([n, cout, oh, ow, cin_per, kh, kw]),
+            ],
+        )
+        callee = self._apply_grouped(
+            callee,
+            [
+                self.world.tuple([self.F32, self.F32]),
+                self.world.tuple([rank_4, rank_4]),
+                self.world.tuple(
+                    [
+                        self.world.tuple(self.shape_of(padded)),
+                        self.world.tuple([cout, cin_per, kh, kw]),
+                    ]
+                ),
+            ],
+        )
+        callee = self._apply_grouped(callee, [self._conv_mac_lambda(), self._f32_float_lit(0.0)])
+        callee = self.world.app(callee, self._affine_projection_lam(7, 4, [0, 1, 2, 3]))
         callee = self.world.app(
             callee,
             self.world.tuple(
-                [self.world.tuple(starts), self.world.tuple(steps), self.world.tuple(out_dims)]
+                [
+                    self._grouped_conv_in_map(cin_per, cout_per, stride, dilation),
+                    self._affine_projection_lam(7, 4, [1, 4, 5, 6]),
+                ]
             ),
         )
-        return self._remember_shape(self.world.app(callee, x), out_dims)
+        result = self.world.app(callee, self.world.tuple([padded, weight]))
+        result = self._remember_shape(result, out_dims)
 
-    def _grouped_convolution(self, x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-        """Grouped conv as `groups` independent convs over channel slices, re-joined on the channel axis.
-
-        %tensor.conv is defined for `groups = 1` only, and the alternative - one map_reduce whose read map
-        derives the group from `co floordiv cout_per_group` - puts a division back into the access map.
-        The per-group extents stay `Nat` expressions; %core.nat folds them when the channels are literal."""
-        if not isinstance(groups, int) or groups < 1:
-            raise NotImplementedError("aten.convolution needs a literal group count")
-
-        cin_per = self.nat_floordiv(self.shape_of(x)[1], groups)
-        cout_per = self.nat_floordiv(self.shape_of(weight)[0], groups)
-
-        parts = []
-        for g in range(groups):
-            x_g = self._slice_dim(x, 1, self._nat_binop(core.nat.mul, g, cin_per), cin_per)
-            w_g = self._slice_dim(weight, 0, self._nat_binop(core.nat.mul, g, cout_per), cout_per)
-            parts.append(self.convolution(x_g, w_g, stride=stride, padding=padding, dilation=dilation))
-
-        result = self.cat(self.world.tuple(parts), dim=1)
         if bias is None:
             return result
 
-        out_dims = self.shape_of(result)
-        bias_shape = [dim if dim == out_dims[1] else self.world.lit_nat(1) for dim in out_dims]
-        return self._remember_shape(self.add(result, self.reshape(bias, bias_shape)), out_dims)
+        per_channel = [cout if i == 1 else self.world.lit_nat(1) for i in range(len(out_dims))]
+        return self._remember_shape(self.add(result, self.reshape(bias, per_channel)), out_dims)
 
     def convolution(self, x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         if not self._is_one_group(groups):
