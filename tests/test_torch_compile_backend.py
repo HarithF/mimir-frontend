@@ -439,3 +439,41 @@ def test_stack_matches_eager(dim):
 
 def test_inplace_residual_matches_eager():
     check_against_eager(InPlaceResidual(), torch.randn(2, 4, 6, 6))
+
+
+class ReLU6Net(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.act = torch.nn.ReLU6()
+
+    def forward(self, x):
+        return self.act(x * 4.0)
+
+
+class HardtanhCustom(torch.nn.Module):
+    def forward(self, x):
+        return torch.nn.functional.hardtanh(x, -0.5, 2.0)
+
+
+class Softmax(torch.nn.Module):
+    def __init__(self, dim, log):
+        super().__init__()
+        self.dim, self.log = dim, log
+
+    def forward(self, x):
+        f = torch.nn.functional.log_softmax if self.log else torch.nn.functional.softmax
+        return f(x, dim=self.dim)
+
+
+def test_relu6_matches_eager():
+    check_against_eager(ReLU6Net(), torch.randn(2, 6))
+
+
+def test_hardtanh_custom_bounds_matches_eager():
+    check_against_eager(HardtanhCustom(), torch.randn(2, 6))
+
+
+@pytest.mark.parametrize("log", [False, True])
+@pytest.mark.parametrize("dim", [0, 1, 2, -1])
+def test_softmax_matches_eager(dim, log):
+    check_against_eager(Softmax(dim, log), torch.randn(2, 3, 4))

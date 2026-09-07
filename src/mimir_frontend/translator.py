@@ -65,6 +65,14 @@ class FXGraphTranslator:
             m[op] = wrapper
             m[name] = wrapper
 
+        # The dunder forms arrive as call_method targets, e.g. `mask == 0` inside a masked_fill.
+        for name, func in (
+            ("__eq__", self.ops.eq), ("__ne__", self.ops.ne),
+            ("__lt__", self.ops.lt), ("__le__", self.ops.le),
+            ("__gt__", self.ops.gt), ("__ge__", self.ops.ge),
+        ):
+            m[name] = self._wrap_binary(func)
+
         m[torch.clamp] = self._wrap_clamp()
         m["aten.clamp.default"] = self._wrap_clamp()
         m["aten.clamp.Tensor"] = self._wrap_clamp()
@@ -193,6 +201,22 @@ class FXGraphTranslator:
         m["aten.stack.default"] = self._wrap_stack()
         m["stack"] = self._wrap_stack()
 
+        m[torch.nn.functional.hardtanh] = self._wrap_hardtanh()
+        m["hardtanh"] = self._wrap_hardtanh()
+        m["aten.hardtanh.default"] = self._wrap_hardtanh()
+        m["aten.hardtanh_.default"] = self._wrap_hardtanh()
+        m[torch.nn.functional.relu6] = self._wrap_hardtanh(0.0, 6.0)
+        m["aten.relu6.default"] = self._wrap_hardtanh(0.0, 6.0)
+
+        m[torch.nn.functional.softmax] = self._wrap_softmax(self.ops.softmax)
+        m["softmax"] = self._wrap_softmax(self.ops.softmax)
+        m["aten.softmax.int"] = self._wrap_softmax(self.ops.softmax)
+        m["aten._softmax.default"] = self._wrap_softmax(self.ops.softmax)
+        m[torch.nn.functional.log_softmax] = self._wrap_softmax(self.ops.log_softmax)
+        m["log_softmax"] = self._wrap_softmax(self.ops.log_softmax)
+        m["aten.log_softmax.int"] = self._wrap_softmax(self.ops.log_softmax)
+        m["aten._log_softmax.default"] = self._wrap_softmax(self.ops.log_softmax)
+
         # Normalization
         m[torch.nn.functional.layer_norm] = self._wrap_layer_norm()
         m["layer_norm"] = self._wrap_layer_norm()
@@ -269,6 +293,24 @@ class FXGraphTranslator:
             weight = args[1]
             bias = args[2] if len(args) > 2 else node.kwargs.get("bias", None)
             return self.ops.linear(input, weight, bias=bias)
+        return convert
+
+    def _wrap_hardtanh(self, min_default=-1.0, max_default=1.0):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            min_val = args[1] if len(args) > 1 else kw.get("min_val", min_default)
+            max_val = args[2] if len(args) > 2 else kw.get("max_val", max_default)
+            return self.ops.hardtanh(args[0], float(min_val), float(max_val))
+        return convert
+
+    def _wrap_softmax(self, op_func):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            dim = args[1] if len(args) > 1 else node.kwargs.get("dim")
+            if dim is None:
+                raise NotImplementedError("softmax without an explicit dim is not implemented")
+            return op_func(args[0], int(dim))
         return convert
 
     def _wrap_stack(self):

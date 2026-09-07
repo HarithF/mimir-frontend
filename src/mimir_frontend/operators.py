@@ -844,9 +844,9 @@ class OperatorLibrary:
         def average(x):
             return self.div(self.sum(x, dim=axes), float(count))
 
-        centered = self.sub(input, self._broadcast_over_suffix(average(input), dims))
+        centered = self.sub(input, self._broadcast_reduced(average(input), dims, axes))
         variance = average(self.mul(centered, centered))
-        result = self.mul(centered, self._broadcast_over_suffix(self.rsqrt(self.add(variance, float(eps))), dims))
+        result = self.mul(centered, self._broadcast_reduced(self.rsqrt(self.add(variance, float(eps))), dims, axes))
 
         trailing = [self.world.lit_nat(1)] * kept + list(dims[kept:])
         if weight is not None:
@@ -855,8 +855,8 @@ class OperatorLibrary:
             result = self.add(result, self.reshape(bias, trailing))
         return self._remember_shape(result, dims)
 
-    def _broadcast_over_suffix(self, x, out_dims):
-        """Broadcasts @p x, whose shape is a prefix of @p out_dims, over the trailing axes."""
+    def _broadcast_reduced(self, x, out_dims, axes):
+        """Broadcasts @p x, the result of reducing @p out_dims over @p axes, back to @p out_dims."""
         in_dims = self.shape_of(x)
         if self.rules.same_shape(in_dims, out_dims):
             return x
@@ -868,9 +868,36 @@ class OperatorLibrary:
         callee = self.world.annex(tensor.broadcast_in_dim.value)
         callee = self._apply_grouped(callee, [self._tensor_element_type(x), in_rank, out_rank])
         idx_t = self.world.type_idx(out_rank)
-        mapping = self.world.tuple([self.world.lit(idx_t, i) for i in range(len(in_dims))])
+        kept = [i for i in range(len(out_dims)) if i not in axes]
+        mapping = self.world.tuple([self.world.lit(idx_t, i) for i in kept])
         result = self.world.app(callee, self.world.tuple([in_shape, out_shape, x, mapping]))
         return self._remember_shape(result, out_dims)
+
+    def softmax(self, input, dim=-1):
+        """`exp(x - amax) / sum(exp(x - amax))` along @p dim; the shift keeps the exponent finite."""
+        dims = self.shape_of(input)
+        if dim < 0:
+            dim += len(dims)
+        axes = [dim]
+
+        shifted = self.sub(input, self._broadcast_reduced(self.amax(input, dim=axes), dims, axes))
+        weights = self.exp(shifted)
+        total = self._broadcast_reduced(self.sum(weights, dim=axes), dims, axes)
+        return self._remember_shape(self.div(weights, total), dims)
+
+    def log_softmax(self, input, dim=-1):
+        dims = self.shape_of(input)
+        if dim < 0:
+            dim += len(dims)
+        axes = [dim]
+
+        shifted = self.sub(input, self._broadcast_reduced(self.amax(input, dim=axes), dims, axes))
+        total = self._broadcast_reduced(self.log(self.sum(self.exp(shifted), dim=axes)), dims, axes)
+        return self._remember_shape(self.sub(shifted, total), dims)
+
+    def hardtanh(self, input, min_val=-1.0, max_val=1.0):
+        """`nn.ReLU6` reaches us as `hardtanh(x, 0, 6)`."""
+        return self.clamp(input, min_val=min_val, max_val=max_val)
 
     def stack(self, tensors, dim=0):
         """`torch.stack`: make room on @p dim in every input, then concatenate along it."""
