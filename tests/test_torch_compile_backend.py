@@ -244,3 +244,294 @@ def test_fast_math_separates_cache_entries(tmp_path):
             torch.testing.assert_close(compiled(x), model(x), rtol=1e-4, atol=1e-4)
 
     assert len({p.name for p in tmp_path.glob("*.so")}) == 2
+
+
+class Bmm(torch.nn.Module):
+    def forward(self, lhs, rhs):
+        return torch.bmm(lhs, rhs)
+
+
+class Matmul(torch.nn.Module):
+    def forward(self, lhs, rhs):
+        return torch.matmul(lhs, rhs)
+
+
+class GroupedConv(torch.nn.Module):
+    def __init__(self, groups):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(6, 12, 3, padding=1, groups=groups)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+def test_bmm_matches_eager():
+    check_against_eager(Bmm(), torch.randn(3, 4, 5), torch.randn(3, 5, 2))
+
+
+@pytest.mark.parametrize(
+    "lhs_shape,rhs_shape",
+    [
+        ((4, 8), (8, 3)),        # 2-D x 2-D
+        ((2, 4, 8), (2, 8, 3)),  # batched, matching prefix
+        ((2, 4, 8), (8, 3)),     # batched x plain matrix
+        ((2, 3, 4, 8), (8, 5)),  # two batch dims
+        ((1, 4, 8), (2, 8, 3)),  # broadcast the batch prefix
+        ((8,), (8, 3)),          # 1-D lhs is promoted then dropped
+        ((4, 8), (8,)),          # 1-D rhs is promoted then dropped
+    ],
+)
+def test_matmul_matches_eager(lhs_shape, rhs_shape):
+    check_against_eager(Matmul(), torch.randn(*lhs_shape), torch.randn(*rhs_shape))
+
+
+@pytest.mark.parametrize("groups", [2, 3, 6])
+def test_grouped_conv_matches_eager(groups):
+    """`groups == 6` is the depthwise case, where every channel is its own group."""
+    check_against_eager(GroupedConv(groups), torch.randn(2, 6, 8, 8))
+
+
+class BatchNormNet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 8, 3, padding=1)
+        self.bn = torch.nn.BatchNorm2d(8)
+
+    def forward(self, x):
+        return torch.relu(self.bn(self.conv(x)))
+
+
+class BatchNormNoAffine(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bn = torch.nn.BatchNorm2d(4, affine=False)
+
+    def forward(self, x):
+        return self.bn(x)
+
+
+class BatchedLinear(torch.nn.Module):
+    def __init__(self, bias=True):
+        super().__init__()
+        self.fc = torch.nn.Linear(8, 5, bias=bias)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+def test_batch_norm_matches_eager():
+    model = BatchNormNet().eval()
+    # Give the running statistics something other than their 0/1 initialization.
+    with torch.no_grad():
+        model.bn.running_mean.normal_()
+        model.bn.running_var.uniform_(0.5, 2.0)
+    check_against_eager(model, torch.randn(2, 3, 8, 8))
+
+
+def test_batch_norm_without_affine_matches_eager():
+    model = BatchNormNoAffine().eval()
+    with torch.no_grad():
+        model.bn.running_mean.normal_()
+        model.bn.running_var.uniform_(0.5, 2.0)
+    check_against_eager(model, torch.randn(2, 4, 5, 5))
+
+
+@pytest.mark.parametrize("shape", [(4, 8), (2, 4, 8), (2, 3, 4, 8)])
+@pytest.mark.parametrize("bias", [True, False])
+def test_batched_linear_matches_eager(shape, bias):
+    check_against_eager(BatchedLinear(bias).eval(), torch.randn(*shape))
+
+
+class PermuteMethod(torch.nn.Module):
+    def forward(self, x):
+        return x.permute(0, 2, 1) + 1.0
+
+
+class TransposeMethod(torch.nn.Module):
+    def forward(self, x):
+        return x.transpose(1, 2) * 2.0
+
+
+class TransposeNegativeDims(torch.nn.Module):
+    def forward(self, x):
+        return x.transpose(-1, -2) * 2.0
+
+
+class UnfoldPatches(torch.nn.Module):
+    """The ViT patch-extraction shape: two non-overlapping unfolds."""
+
+    def forward(self, x):
+        return x.unfold(2, 2, 2).unfold(3, 2, 2) + 0.5
+
+
+class ToDtype(torch.nn.Module):
+    def forward(self, x):
+        return x.to(torch.float32) + 1.0
+
+
+def test_permute_method_matches_eager():
+    check_against_eager(PermuteMethod(), torch.randn(2, 3, 4))
+
+
+def test_transpose_method_matches_eager():
+    check_against_eager(TransposeMethod(), torch.randn(2, 3, 4))
+
+
+def test_transpose_negative_dims_matches_eager():
+    check_against_eager(TransposeNegativeDims(), torch.randn(2, 3, 4))
+
+
+def test_unfold_matches_eager():
+    check_against_eager(UnfoldPatches(), torch.randn(2, 3, 4, 4))
+
+
+def test_to_dtype_matches_eager():
+    check_against_eager(ToDtype(), torch.randn(2, 4))
+
+
+class LayerNormNet(torch.nn.Module):
+    def __init__(self, normalized_shape, affine):
+        super().__init__()
+        self.ln = torch.nn.LayerNorm(normalized_shape, elementwise_affine=affine)
+
+    def forward(self, x):
+        return self.ln(x)
+
+
+class StackNet(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x, y):
+        return torch.stack([x, y, x + y], dim=self.dim)
+
+
+class InPlaceResidual(torch.nn.Module):
+    """The `out += identity` shape of a residual block."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(4, 4, 3, padding=1)
+
+    def forward(self, x):
+        out = self.conv(x)
+        out += x
+        out *= 0.5
+        return torch.relu(out)
+
+
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("normalized_shape,shape", [((8,), (2, 3, 8)), ((3, 8), (2, 3, 8))])
+def test_layer_norm_matches_eager(normalized_shape, shape, affine):
+    model = LayerNormNet(normalized_shape, affine).eval()
+    if affine:
+        with torch.no_grad():
+            model.ln.weight.normal_()
+            model.ln.bias.normal_()
+    check_against_eager(model, torch.randn(*shape))
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_stack_matches_eager(dim):
+    check_against_eager(StackNet(dim), torch.randn(2, 4), torch.randn(2, 4))
+
+
+def test_inplace_residual_matches_eager():
+    check_against_eager(InPlaceResidual(), torch.randn(2, 4, 6, 6))
+
+
+class ReLU6Net(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.act = torch.nn.ReLU6()
+
+    def forward(self, x):
+        return self.act(x * 4.0)
+
+
+class HardtanhCustom(torch.nn.Module):
+    def forward(self, x):
+        return torch.nn.functional.hardtanh(x, -0.5, 2.0)
+
+
+class Softmax(torch.nn.Module):
+    def __init__(self, dim, log):
+        super().__init__()
+        self.dim, self.log = dim, log
+
+    def forward(self, x):
+        f = torch.nn.functional.log_softmax if self.log else torch.nn.functional.softmax
+        return f(x, dim=self.dim)
+
+
+def test_relu6_matches_eager():
+    check_against_eager(ReLU6Net(), torch.randn(2, 6))
+
+
+def test_hardtanh_custom_bounds_matches_eager():
+    check_against_eager(HardtanhCustom(), torch.randn(2, 6))
+
+
+@pytest.mark.parametrize("log", [False, True])
+@pytest.mark.parametrize("dim", [0, 1, 2, -1])
+def test_softmax_matches_eager(dim, log):
+    check_against_eager(Softmax(dim, log), torch.randn(2, 3, 4))
+
+
+class MaskedFill(torch.nn.Module):
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+    def forward(self, x, mask):
+        return x.masked_fill(mask == 0, self.value)
+
+
+class CausalAttentionShape(torch.nn.Module):
+    """masked_fill with -inf followed by softmax, as a causal attention does."""
+
+    def forward(self, att, mask):
+        att = att.masked_fill(mask == 0, float("-inf"))
+        return torch.nn.functional.softmax(att, dim=-1)
+
+
+class Normalize(torch.nn.Module):
+    def __init__(self, p, dim):
+        super().__init__()
+        self.p, self.dim = p, dim
+
+    def forward(self, x):
+        return torch.nn.functional.normalize(x, p=self.p, dim=self.dim)
+
+
+class Mean(torch.nn.Module):
+    def __init__(self, dim, keepdim):
+        super().__init__()
+        self.dim, self.keepdim = dim, keepdim
+
+    def forward(self, x):
+        return torch.mean(x, dim=self.dim, keepdim=self.keepdim)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.5])
+def test_masked_fill_matches_eager(value):
+    mask = (torch.rand(2, 4) > 0.5).float()
+    check_against_eager(MaskedFill(value), torch.randn(2, 4), mask)
+
+
+def test_causal_mask_then_softmax_matches_eager():
+    mask = torch.tril(torch.ones(4, 4))
+    check_against_eager(CausalAttentionShape(), torch.randn(2, 4, 4), mask)
+
+
+@pytest.mark.parametrize("p", [1.0, 2.0])
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_normalize_matches_eager(p, dim):
+    check_against_eager(Normalize(p, dim), torch.randn(3, 5) + 0.5)
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_mean_matches_eager(dim, keepdim):
+    check_against_eager(Mean(dim, keepdim), torch.randn(2, 3, 4))

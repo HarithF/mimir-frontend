@@ -1,12 +1,12 @@
 import mim
 import struct
-from mim._plugins.affine import affine
+from mim._plugins.affine import affine, _affine_op, _affine_semiop
 from mim._plugins.math import math, _math_arith, _math_extrema, _math_cmp, _math_exp, _math_tri, _math_rt
 from mim._plugins.tensor import tensor
 from mim._plugins.core import core, _core_bit1, _core_bit2
 
 from .fastmath import Mode, parse_mode
-from .shape_rules import ShapeRules
+from .shape_rules import ShapeRules, lit_nat_value
 from . import expr
 
 class OperatorLibrary:
@@ -61,7 +61,7 @@ class OperatorLibrary:
         # Complex
         self.f32_sigmoid_axm = bind_math_axm(math.slf)
         self.f32_rsqrt_axm = bind_math_axm(math.rrt)
-        self.affine_index = world.annex(affine.index.value)
+        self.affine_index = world.annex(affine.Idx.value)
 
         # Bitwise/Logical
         s_bool = world.lit_nat(2)
@@ -149,7 +149,9 @@ class OperatorLibrary:
         return dims
 
     def _is_lit_nat_value(self, value, expected: int) -> bool:
-        return isinstance(value, mim.Lit) and value.get_nat() == expected
+        # Lit exposes no value accessor; the World is hash-consed, so an identical
+        # literal compares equal.
+        return isinstance(value, mim.Lit) and value == self.world.lit_nat(expected)
 
     def _apply_grouped(self, callee, args):
         return self.world.app(callee, self.world.tuple(args))
@@ -159,7 +161,7 @@ class OperatorLibrary:
         out_type = self.world.arr(self.world.lit_nat(output_rank), self.affine_index)
         lam = self.world.mut_lam(vec_type, out_type)
         iters = lam.var()
-        lam.set_body(True, self.world.tuple([iters.proj(total_rank, index) for index in projections]))
+        lam.set([self.world.lit_tt(), self.world.tuple([iters.proj(total_rank, index) for index in projections])])
         return lam
 
     def _f32_reduce_lambda(self, op):
@@ -174,7 +176,7 @@ class OperatorLibrary:
         args_type = self.world.arr(self.world.lit_nat(2), arg_type)
         lam = self.world.mut_lam(args_type, ret_type)
         args = lam.var()
-        lam.set_body(True, self.world.app(op, [args.proj(2, 0), args.proj(2, 1)]))
+        lam.set([self.world.lit_tt(), self.world.app(op, [args.proj(2, 0), args.proj(2, 1)])])
         return lam
 
     def _tensor_element_type(self, tensor_def):
@@ -267,7 +269,7 @@ class OperatorLibrary:
     def _f32_pair_to_mean_lambda(self, pair_type):
         lam = self.world.mut_lam(pair_type, self.F32)
         pair = lam.var()
-        lam.set_body(True, self.world.app(self.f32_div_axm, [pair.proj(2, 0), pair.proj(2, 1)]))
+        lam.set([self.world.lit_tt(), self.world.app(self.f32_div_axm, [pair.proj(2, 0), pair.proj(2, 1)])])
         return lam
 
     # Arithmetic
@@ -368,7 +370,7 @@ class OperatorLibrary:
             callee = self.world.annex(core.select.value)
             callee = self.world.app(callee, self.F32)
             res = self._apply_grouped(callee, [v, self._f32_float_lit(1.0), self._f32_float_lit(0.0)])
-            lam.set_body(True, res)
+            lam.set([self.world.lit_tt(), res])
             return self.unary(lam, x, out_type=self.F32)
             
         if in_type == self.F32 and out_type == self.Bool:
@@ -455,7 +457,7 @@ class OperatorLibrary:
             callee = self.world.annex(tensor.map.value)
             callee = self._apply_grouped(callee, [elem_type, self.world.lit_nat(0), self.world.tuple([])])
             lam = self.world.mut_lam(self.world.sigma([]), elem_type)
-            lam.set_body(True, input)
+            lam.set([self.world.lit_tt(), input])
             callee = self.world.app(callee, lam)
             callee = self.world.app(callee, self.world.tuple([out_rank, out_shape_tuple]))
             result = self.world.app(callee, self.world.tuple([]))
@@ -502,7 +504,7 @@ class OperatorLibrary:
         callee = self.world.app(callee, self.world.tuple([elem_type, ni, Is]))
         
         lam = self.world.mut_lam(self.world.sigma([]), elem_type)
-        lam.set_body(True, scalar_def)
+        lam.set([self.world.lit_tt(), scalar_def])
         
         callee = self.world.app(callee, lam)
         callee = self.world.app(callee, self.world.tuple([out_rank, out_shape_tuple]))
@@ -526,7 +528,7 @@ class OperatorLibrary:
 
         callee = self.world.annex(tensor.map_reduce.value)
         callee = self.world.app(callee, self.world.lit_nat(1)) # nis = 1 input tensor
-        callee = self._apply_grouped(callee, [output_type, self.world.lit_nat(output_rank), self.world.lit_nat(reduce_rank)])
+        callee = self._apply_grouped(callee, [output_type, self.world.lit_nat(output_rank), self.world.lit_nat(total_rank)])
         callee = self._apply_grouped(callee, [self.world.tuple(spec.output_dims), self.world.tuple(spec.loop_dims)])
         
         in_elem_type = self._tensor_element_type(input)
@@ -582,9 +584,37 @@ class OperatorLibrary:
         return lam
 
     def mean(self, input, dim=None, keepdim=False):
-        """
-        Translates to mean reduction.
-        """
+        """`sum` over a scalar accumulator, divided by the reduced extent.
+
+        Falls back to the `(sum, count)` accumulator when an extent is not literal: that one does
+        not bufferize, but it is the only way to count a symbolic extent."""
+        dims = self.shape_of(input)
+        axes = self.rules.normalize_reduce_dims(dim, len(dims))
+
+        # A reduction over every axis leaves nothing for the elementwise divide to range over.
+        if len(axes) == len(dims):
+            return self._mean_pairwise(input, dim=dim, keepdim=keepdim)
+
+        count = 1
+        for axis in axes:
+            extent = lit_nat_value(dims[axis])
+            if extent is None:
+                return self._mean_pairwise(input, dim=dim, keepdim=keepdim)
+            count *= extent
+
+        # Divide before restoring the reduced axes: a size-1 axis collapses out of the type, and the
+        # elementwise divide would then disagree with the remembered rank.
+        averaged = self.div(self.sum(input, dim=dim, keepdim=False), float(count))
+        if not keepdim:
+            return averaged
+
+        kept = [self.world.lit_nat(1) if i in axes else d for i, d in enumerate(dims)]
+        return self.reshape(averaged, kept)
+
+    def _mean_pairwise(self, input, dim=None, keepdim=False):
+        """Mean through a `(sum, count)` accumulator, which counts a non-literal extent at run time.
+
+        The accumulator makes the reduction's element type an array, which does not bufferize."""
         pair_type = self.world.arr(self.world.lit_nat(2), self.F32)
         reduced, output_dims = self._reduce_aff(
             input,
@@ -647,9 +677,9 @@ class OperatorLibrary:
             mean_sq = self.world.app(self.f32_mul_axm, [mean, mean])
             e_x_sq = self.world.app(self.f32_div_axm, [s_sq, c])
             var = self.world.app(self.f32_sub_axm, [e_x_sq, mean_sq])
-            lam.set_body(True, var)
+            lam.set([self.world.lit_tt(), var])
         else:
-            lam.set_body(True, mean)
+            lam.set([self.world.lit_tt(), mean])
             
         return lam
 
@@ -689,16 +719,82 @@ class OperatorLibrary:
         callee = self.world.app(callee, ring)
         return self.world.implicit_app(callee, [lhs, rhs])
 
+    def bmm(self, lhs, rhs):
+        lhs_dims = self.shape_of(lhs)
+        rhs_dims = self.shape_of(rhs)
+        # Composite graphs expose folded operands on either side; matmul owns the broadcast semantics.
+        if len(lhs_dims) != 3 or len(rhs_dims) != 3:
+            return self.matmul(lhs, rhs)
+        if not self.rules._same_dim(lhs_dims[0], rhs_dims[0]):
+            return self.matmul(lhs, rhs)
+        if not self.rules._same_dim(lhs_dims[2], rhs_dims[1]):
+            raise NotImplementedError("aten.bmm contraction extents do not match")
+
+        ring = self.world.tuple([self.F32, self._f32_float_lit(0.0), self.f32_add_axm, self.f32_mul_axm])
+        callee = self.world.app(self.world.annex(tensor.bmm.value), ring)
+        result = self.world.implicit_app(callee, [lhs, rhs])
+        return self._remember_shape(result, [lhs_dims[0], lhs_dims[1], rhs_dims[2]])
+
+    def matmul(self, lhs, rhs):
+        """`torch.matmul`: the 1-D/2-D cases plus a batched product over a broadcast batch prefix."""
+        lhs_dims = self.shape_of(lhs)
+        rhs_dims = self.shape_of(rhs)
+        lhs_rank, rhs_rank = len(lhs_dims), len(rhs_dims)
+
+        if lhs_rank == 0 or rhs_rank == 0:
+            raise NotImplementedError("torch.matmul requires operands of rank >= 1")
+        if lhs_rank == 1 and rhs_rank == 1:
+            # The rank-0 result would collapse out of its own type; see the size-1 axis caveat.
+            raise NotImplementedError("torch.matmul of two 1-D operands is not implemented")
+
+        # A 1-D operand acts as a matrix with a prepended (lhs) or appended (rhs) singleton that is dropped
+        # again. Only the appended one survives: a leading size-1 axis collapses out of the Mim type, and
+        # `«1, k; T»` then unifies against `«m, k; T»` with `m = k`. `v @ M` is `Mᵀ @ v`, which needs none.
+        if lhs_rank == 1:
+            if rhs_rank != 2:
+                raise NotImplementedError("torch.matmul with a 1-D lhs needs a 2-D rhs")
+            return self.matmul(self.transpose(rhs, [1, 0]), lhs)
+        if rhs_rank == 1:
+            out = self.matmul(lhs, self.reshape(rhs, [rhs_dims[0], self.world.lit_nat(1)]))
+            return self.reshape(out, self.shape_of(out)[:-1])
+
+        if not self.rules._same_dim(lhs_dims[-1], rhs_dims[-2]):
+            raise NotImplementedError("torch.matmul contraction extents do not match")
+
+        rows, contract = lhs_dims[-2:]
+        cols = rhs_dims[-1]
+        if lhs_rank == 2 and rhs_rank == 2:
+            return self._remember_shape(self.mm(lhs, rhs), [rows, cols])
+
+        batch = self.rules.broadcast_shape(lhs_dims[:-2], rhs_dims[:-2])
+        flat = self._nat_product(batch)
+        lhs3 = self.reshape(self._broadcast_batch(lhs, batch, [rows, contract]), [flat, rows, contract])
+        rhs3 = self.reshape(self._broadcast_batch(rhs, batch, [contract, cols]), [flat, contract, cols])
+        return self.reshape(self.bmm(lhs3, rhs3), list(batch) + [rows, cols])
+
+    def _broadcast_batch(self, x, batch, tail):
+        """Expands @p x's batch prefix to @p batch, keeping its trailing @p tail dims."""
+        have = self.shape_of(x)[: -len(tail)]
+        if self.rules.same_shape(have, batch):
+            return x
+        # Right-align the existing prefix under `batch`, then tile the singleton axes out.
+        padded = [self.world.lit_nat(1)] * (len(batch) - len(have)) + list(have)
+        if len(padded) != len(have):
+            x = self.reshape(x, padded + list(tail))
+        return self.repeat(x, list(batch) + list(tail))
+
     def linear(self, input, weight, bias=None):
         input_dims = self.shape_of(input)
         weight_dims = self.shape_of(weight)
-        if len(input_dims) != 2 or len(weight_dims) != 2:
-            raise NotImplementedError("linear currently supports 2D input and 2D weight only")
+        if len(weight_dims) != 2:
+            raise NotImplementedError("linear currently supports a 2D weight only")
+        if not self.rules._same_dim(input_dims[-1], weight_dims[1]):
+            raise NotImplementedError("linear weight in_features must match input features")
+        if len(input_dims) != 2:
+            return self._batched_linear(input, weight, bias, input_dims, weight_dims[0])
 
         in_features = input_dims[1]
         out_features = weight_dims[0]
-        if weight_dims[1] != in_features:
-            raise NotImplementedError("linear weight in_features must match input features")
 
         transposed_weight = self.transpose(weight, [1, 0])
         if bias is None:
@@ -710,9 +806,295 @@ class OperatorLibrary:
             result = self.add(self.mm(input, transposed_weight), bias_expanded)
         return self._remember_shape(result, [input_dims[0], out_features])
 
+    def _batched_linear(self, input, weight, bias, input_dims, out_features):
+        """`linear` over a leading batch prefix: contract the trailing axis, then add the bias per output."""
+        result = self.matmul(input, self.transpose(weight, [1, 0]))
+        out_dims = list(input_dims[:-1]) + [out_features]
+        result = self._remember_shape(result, out_dims)
+        if bias is None:
+            return result
+
+        bias_shape = [self.world.lit_nat(1)] * (len(out_dims) - 1) + [out_features]
+        return self._remember_shape(self.add(result, self.reshape(bias, bias_shape)), out_dims)
+
+    def batch_norm(self, input, weight=None, bias=None, running_mean=None, running_var=None,
+                   training=False, eps=1e-5):
+        """`(x - mean) * rsqrt(var + eps) * weight + bias`, per channel.
+
+        Only the inference form: the batch statistics of a training-mode norm would have to be
+        reduced out of `input` first."""
+        if training:
+            raise NotImplementedError("batch_norm in training mode is not implemented")
+        if running_mean is None or running_var is None:
+            raise NotImplementedError("batch_norm without running statistics is not implemented")
+
+        dims = self.shape_of(input)
+        if len(dims) < 2:
+            raise NotImplementedError("batch_norm expects an input with a channel axis")
+        channels = dims[1]
+
+        # Fold weight into the scale and mean into the shift, so the input is touched twice.
+        scale = self.rsqrt(self.add(running_var, float(eps)))
+        if weight is not None:
+            scale = self.mul(scale, weight)
+        shift = self.mul(running_mean, scale)
+
+        per_channel = [channels if i == 1 else self.world.lit_nat(1) for i in range(len(dims))]
+        result = self.sub(
+            self.mul(input, self.reshape(scale, per_channel)),
+            self.reshape(shift, per_channel),
+        )
+        if bias is not None:
+            result = self.add(result, self.reshape(bias, per_channel))
+        return self._remember_shape(result, dims)
+
+    def layer_norm(self, input, normalized_shape, weight=None, bias=None, eps=1e-5):
+        """`(x - mean) * rsqrt(var + eps) * weight + bias` over the trailing `normalized_shape` axes.
+
+        The variance is the biased one, as torch uses for a norm rather than for `torch.var`."""
+        dims = self.shape_of(input)
+        kept = len(dims) - len(normalized_shape)
+        if not normalized_shape or kept < 0:
+            raise NotImplementedError("layer_norm needs normalized_shape to be a suffix of the input shape")
+
+        # `sum` and an explicit divisor rather than `mean` or `var_mean`: those accumulate into an array
+        # element type, which does not bufferize. Reductions drop keepdim, because a trailing size-1 axis
+        # collapses out of the type and leaves %tensor.broadcast a rank-deficient operand - hence the
+        # explicit broadcast back over the reduced axes.
+        axes = list(range(kept, len(dims)))
+        count = 1
+        for axis in axes:
+            extent = lit_nat_value(dims[axis])
+            if extent is None:
+                raise NotImplementedError("layer_norm needs literal extents over the normalized axes")
+            count *= extent
+
+        def average(x):
+            return self.div(self.sum(x, dim=axes), float(count))
+
+        centered = self.sub(input, self._broadcast_reduced(average(input), dims, axes))
+        variance = average(self.mul(centered, centered))
+        result = self.mul(centered, self._broadcast_reduced(self.rsqrt(self.add(variance, float(eps))), dims, axes))
+
+        trailing = [self.world.lit_nat(1)] * kept + list(dims[kept:])
+        if weight is not None:
+            result = self.mul(result, self.reshape(weight, trailing))
+        if bias is not None:
+            result = self.add(result, self.reshape(bias, trailing))
+        return self._remember_shape(result, dims)
+
+    def _broadcast_reduced(self, x, out_dims, axes):
+        """Broadcasts @p x, the result of reducing @p out_dims over @p axes, back to @p out_dims."""
+        in_dims = self.shape_of(x)
+        if self.rules.same_shape(in_dims, out_dims):
+            return x
+
+        in_rank, in_shape = self._rank_and_shape(x)
+        out_rank = self.world.lit_nat(len(out_dims))
+        out_shape, _ = self._extract_shape(out_dims)
+
+        callee = self.world.annex(tensor.broadcast_in_dim.value)
+        callee = self._apply_grouped(callee, [self._tensor_element_type(x), in_rank, out_rank])
+        idx_t = self.world.type_idx(out_rank)
+        kept = [i for i in range(len(out_dims)) if i not in axes]
+        mapping = self.world.tuple([self.world.lit(idx_t, i) for i in kept])
+        result = self.world.app(callee, self.world.tuple([in_shape, out_shape, x, mapping]))
+        return self._remember_shape(result, out_dims)
+
+    def softmax(self, input, dim=-1):
+        """`exp(x - amax) / sum(exp(x - amax))` along @p dim; the shift keeps the exponent finite."""
+        dims = self.shape_of(input)
+        if dim < 0:
+            dim += len(dims)
+        axes = [dim]
+
+        shifted = self.sub(input, self._broadcast_reduced(self.amax(input, dim=axes), dims, axes))
+        weights = self.exp(shifted)
+        total = self._broadcast_reduced(self.sum(weights, dim=axes), dims, axes)
+        return self._remember_shape(self.div(weights, total), dims)
+
+    def log_softmax(self, input, dim=-1):
+        dims = self.shape_of(input)
+        if dim < 0:
+            dim += len(dims)
+        axes = [dim]
+
+        shifted = self.sub(input, self._broadcast_reduced(self.amax(input, dim=axes), dims, axes))
+        total = self._broadcast_reduced(self.log(self.sum(self.exp(shifted), dim=axes)), dims, axes)
+        return self._remember_shape(self.sub(shifted, total), dims)
+
+    def masked_fill(self, input, mask, value):
+        """`torch.masked_fill`: @p value where @p mask holds, @p input elsewhere.
+
+        The filler is built elementwise from @p input rather than with `full`, whose zero-input
+        `%tensor.map` does not typecheck."""
+        dims = self.shape_of(input)
+        filler = self.add(self.mul(input, 0.0), float(value))
+        return self._remember_shape(self.where(mask, filler, input), dims)
+
+    def normalize(self, input, p=2.0, dim=1, eps=1e-12):
+        """`F.normalize`: divide by the p-norm along @p dim, floored at @p eps."""
+        dims = self.shape_of(input)
+        if dim < 0:
+            dim += len(dims)
+        axes = [dim]
+
+        if float(p) == 2.0:
+            norm = self.sqrt(self.sum(self.mul(input, input), dim=axes))
+        elif float(p) == 1.0:
+            norm = self.sum(self.abs(input), dim=axes)
+        else:
+            raise NotImplementedError(f"F.normalize with p={p} is not implemented")
+
+        floored = self.clamp_min(norm, float(eps))
+        return self._remember_shape(self.div(input, self._broadcast_reduced(floored, dims, axes)), dims)
+
+    def hardtanh(self, input, min_val=-1.0, max_val=1.0):
+        """`nn.ReLU6` reaches us as `hardtanh(x, 0, 6)`."""
+        return self.clamp(input, min_val=min_val, max_val=max_val)
+
+    def stack(self, tensors, dim=0):
+        """`torch.stack`: make room on @p dim in every input, then concatenate along it."""
+        tensors = list(tensors)
+        if not tensors:
+            raise NotImplementedError("torch.stack needs at least one input")
+        if dim < 0:
+            dim += len(self.shape_of(tensors[0])) + 1
+        return self.cat(self.world.tuple([self.unsqueeze(t, dim) for t in tensors]), dim=dim)
+
+    def _is_one_group(self, groups):
+        if isinstance(groups, int): return groups == 1
+        return self._is_lit_nat_value(groups, 1)
+
+    def _pad_spatial(self, x, padding):
+        """Zero-pads the spatial axes of an NCHW tensor, so the windowed read stays a pure affine map."""
+        rank, in_shape_tuple = self._rank_and_shape(x)
+        in_dims = self.shape_of(x)
+        zero = self.world.lit_nat(0)
+        lohi = self.world.tuple([zero, zero, self._to_nat(padding[0]), self._to_nat(padding[1])])
+
+        # `%tensor.pad`'s `pad_shape` is `(lo + s) + hi`; matching it keeps the extents structurally equal.
+        def grown(axis, amount):
+            return self._nat_binop(
+                core.nat.add, self._nat_binop(core.nat.add, amount, in_dims[axis]), amount
+            )
+
+        out_dims = [in_dims[0], in_dims[1], grown(2, padding[0]), grown(3, padding[1])]
+
+        callee = self.world.annex(tensor.pad.value)
+        callee = self._apply_grouped(callee, [self._tensor_element_type(x), rank])
+        callee = self.world.app(callee, in_shape_tuple)
+        callee = self.world.app(callee, self.world.tuple([zero, lohi, lohi]))
+        return self._remember_shape(self.world.app(callee, [x, self._f32_float_lit(0.0)]), out_dims)
+
+    def _conv_mac_lambda(self):
+        """`(acc, (a, b)) ↦ acc + a·b`, the convolution reduction's multiply-accumulate."""
+        pair = self.world.arr(self.world.lit_nat(2), self.F32)
+        args = self.world.sigma([self.F32, pair])
+        lam = self.world.mut_con([args, self.world.cn([self.F32])])
+        acc, ab = lam.var(0).proj(2, 0), lam.var(0).proj(2, 1)
+        product = self.world.app(self.f32_mul_axm, [ab.proj(2, 0), ab.proj(2, 1)])
+        lam.app(True, lam.ret_var(), [self.world.app(self.f32_add_axm, [acc, product])])
+        return lam
+
+    def _grouped_conv_in_map(self, cin_per, cout_per, stride, dilation):
+        """`(n, co, oh, ow, ci, kh, kw)` ↦ the padded-input read
+        `(n, (co floordiv cout_per)·cin_per + ci, oh·sh + kh·dh, ow·sw + kw·dw)`.
+
+        Recovering the group from the output channel is what lets all `groups` convolutions share one
+        loop nest; a depthwise conv has both factors 1, so the channel read folds back to a projection."""
+        add = self.world.annex(_affine_op.add.value)
+        mul = self.world.annex(_affine_semiop.mul.value)
+        floordiv = self.world.annex(_affine_semiop.floordiv.value)
+
+        lam = self.world.mut_lam(
+            self.world.arr(self.world.lit_nat(7), self.affine_index),
+            self.world.arr(self.world.lit_nat(4), self.affine_index),
+        )
+        o = lam.var()
+
+        def scaled(index, factor):
+            return self.world.app(mul, [o.proj(7, index), self._to_nat(factor)])
+
+        group = self.world.app(floordiv, [o.proj(7, 1), self._to_nat(cout_per)])
+        channel = self.world.app(
+            add, [self.world.app(mul, [group, self._to_nat(cin_per)]), o.proj(7, 4)]
+        )
+        row = self.world.app(add, [scaled(2, stride[0]), scaled(5, dilation[0])])
+        col = self.world.app(add, [scaled(3, stride[1]), scaled(6, dilation[1])])
+
+        lam.set([self.world.lit_tt(), self.world.tuple([o.proj(7, 0), channel, row, col])])
+        return lam
+
+    def _grouped_convolution(self, x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        """Grouped conv as a single `%tensor.map_reduce` over `(n, co, oh, ow, ci, kh, kw)`, whose
+        input read map derives the group from the output channel; `%tensor.conv` covers `groups = 1` only."""
+        in_dims = self.shape_of(x)
+        weight_dims = self.shape_of(weight)
+        if len(in_dims) != 4 or len(weight_dims) != 4:
+            raise NotImplementedError("grouped aten.convolution currently supports 4D NCHW inputs only")
+
+        stride = self._pair(stride, "stride")
+        padding = self._pair(padding, "padding")
+        dilation = self._pair(dilation, "dilation")
+
+        n, _cin, h, w = in_dims
+        cout, cin_per, kh, kw = weight_dims
+        cout_per = self.nat_floordiv(cout, groups)
+        oh, ow = self._conv2d_spatial_shape((h, w), (kh, kw), stride, dilation, padding)
+        out_dims = [n, cout, oh, ow]
+
+        padded = self._pad_spatial(x, padding)
+        rank_4 = self.world.lit_nat(4)
+
+        callee = self.world.annex(tensor.map_reduce.value)
+        callee = self.world.app(callee, self.world.lit_nat(2))
+        callee = self._apply_grouped(callee, [self.F32, rank_4, self.world.lit_nat(7)])
+        callee = self._apply_grouped(
+            callee,
+            [
+                self.world.tuple(out_dims),
+                self.world.tuple([n, cout, oh, ow, cin_per, kh, kw]),
+            ],
+        )
+        callee = self._apply_grouped(
+            callee,
+            [
+                self.world.tuple([self.F32, self.F32]),
+                self.world.tuple([rank_4, rank_4]),
+                self.world.tuple(
+                    [
+                        self.world.tuple(self.shape_of(padded)),
+                        self.world.tuple([cout, cin_per, kh, kw]),
+                    ]
+                ),
+            ],
+        )
+        callee = self._apply_grouped(callee, [self._conv_mac_lambda(), self._f32_float_lit(0.0)])
+        callee = self.world.app(callee, self._affine_projection_lam(7, 4, [0, 1, 2, 3]))
+        callee = self.world.app(
+            callee,
+            self.world.tuple(
+                [
+                    self._grouped_conv_in_map(cin_per, cout_per, stride, dilation),
+                    self._affine_projection_lam(7, 4, [1, 4, 5, 6]),
+                ]
+            ),
+        )
+        result = self.world.app(callee, self.world.tuple([padded, weight]))
+        result = self._remember_shape(result, out_dims)
+
+        if bias is None:
+            return result
+
+        per_channel = [cout if i == 1 else self.world.lit_nat(1) for i in range(len(out_dims))]
+        return self._remember_shape(self.add(result, self.reshape(bias, per_channel)), out_dims)
+
     def convolution(self, x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-        if groups != 1:
-            raise NotImplementedError("aten.convolution with groups != 1 is not implemented")
+        if not self._is_one_group(groups):
+            return self._grouped_convolution(
+                x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups
+            )
 
         semantic_in_dims = self.shape_of(x)
         weight_dims = self.shape_of(weight)
@@ -750,19 +1132,10 @@ class OperatorLibrary:
         result = self._remember_shape(result, out_dims)
 
         if bias is not None:
-            add_dims = self._shape_dims(result)
-            bias_shape = []
-            for dim in add_dims:
-                if dim == cout:
-                    bias_shape.append(cout)
-                else:
-                    bias_shape.append(1)
-            if not bias_shape:
-                bias_shape = [cout]
-            bias = self.reshape(bias, bias_shape)
-            self._remember_shape(result, add_dims)
-            result = self.add(result, bias)
-            self._remember_shape(result, out_dims)
+            # Positional: matching the channel extent by value also caught a spatial axis of the same size.
+            per_channel = [cout if i == 1 else self.world.lit_nat(1) for i in range(len(out_dims))]
+            result = self.add(result, self.reshape(bias, per_channel))
+            result = self._remember_shape(result, out_dims)
         return result
 
     def _to_nat(self, value):
@@ -1073,6 +1446,27 @@ class OperatorLibrary:
         result = self.world.app(callee, tensors)
         return self._remember_shape(result, out_dims)
 
+    def unfold(self, x, dim, size, step):
+        """`Tensor.unfold`: window @p dim, appending the window as the last axis.
+
+        Only the non-overlapping case, where the windows tile the axis exactly; a strided window
+        would need a read map rather than a reshape."""
+        dims = self.shape_of(x)
+        rank = len(dims)
+        if dim < 0:
+            dim += rank
+        if size != step:
+            raise NotImplementedError("unfold with step != size is not implemented")
+
+        extent = lit_nat_value(dims[dim])
+        if extent is None or extent % size:
+            raise NotImplementedError("unfold needs a literal axis extent divisible by the window")
+
+        split = list(dims)
+        split[dim : dim + 1] = [self.world.lit_nat(extent // size), self.world.lit_nat(size)]
+        windowed = self.reshape(x, split)
+        return self.transpose(windowed, [i for i in range(rank + 1) if i != dim + 1] + [dim + 1])
+
     def transpose(self, x, permutation):
         """
         Translates to `%tensor.transpose`.
@@ -1087,9 +1481,12 @@ class OperatorLibrary:
         idx_t = self.world.type_idx(rank_val)
         perm_mim = self.world.tuple([self.world.lit(idx_t, p) for p in permutation])
         
+        # {T, r} -> [permutation] -> {s} -> [input]
         callee = self.world.annex(tensor.transpose.value)
-        callee = self._apply_grouped(callee, [elem_t, rank_val, in_shape_tuple])
-        result = self.world.app(callee, [x, perm_mim])
+        callee = self._apply_grouped(callee, [elem_t, rank_val])
+        callee = self.world.app(callee, perm_mim)
+        callee = self.world.app(callee, in_shape_tuple)
+        result = self.world.app(callee, x)
         return self._remember_shape(result, out_dims)
 
     def _is_one(self, d):

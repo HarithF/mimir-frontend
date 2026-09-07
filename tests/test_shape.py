@@ -1,4 +1,6 @@
 import mim
+
+from mimir_frontend.shape_rules import lit_nat_value
 import pytest
 
 from mimir_frontend.translator import FXGraphTranslator
@@ -20,12 +22,6 @@ def make_symbolic_tensor_input(world: mim.World, dims, elem_type=None):
     else:
         tensor_ty = world.arr(world.tuple(dims), elem_type)
     return world.mut_con(tensor_ty).var()
-
-
-def lit_nat_value(dim: mim.Def):
-    if isinstance(dim, mim.Lit) and hasattr(dim, "get_nat"):
-        return dim.get_nat()
-    return None
 
 
 def assert_dim_is_literal(dim: mim.Def, value):

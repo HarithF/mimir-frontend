@@ -3,6 +3,7 @@ from torch import fx
 import mim
 from .fastmath import Mode
 from .operators import OperatorLibrary
+from .shape_rules import lit_nat_value
 from mim._plugins.compile import compile as mim_compile
 import operator
 from collections.abc import Callable
@@ -53,6 +54,25 @@ class FXGraphTranslator:
             for name in names:
                 m[name] = wrapper
 
+        # Dynamo's graph is functional, so an in-place operator is just its computation.
+        for op, name, func in (
+            (operator.iadd, "aten.add_.Tensor", self.ops.add),
+            (operator.isub, "aten.sub_.Tensor", self.ops.sub),
+            (operator.imul, "aten.mul_.Tensor", self.ops.mul),
+            (operator.itruediv, "aten.div_.Tensor", self.ops.div),
+        ):
+            wrapper = self._wrap_binary(func)
+            m[op] = wrapper
+            m[name] = wrapper
+
+        # The dunder forms arrive as call_method targets, e.g. `mask == 0` inside a masked_fill.
+        for name, func in (
+            ("__eq__", self.ops.eq), ("__ne__", self.ops.ne),
+            ("__lt__", self.ops.lt), ("__le__", self.ops.le),
+            ("__gt__", self.ops.gt), ("__ge__", self.ops.ge),
+        ):
+            m[name] = self._wrap_binary(func)
+
         m[torch.clamp] = self._wrap_clamp()
         m["aten.clamp.default"] = self._wrap_clamp()
         m["aten.clamp.Tensor"] = self._wrap_clamp()
@@ -90,7 +110,17 @@ class FXGraphTranslator:
         m["aten.cat.default"] = self._wrap_cat()
         m[torch.permute] = self._wrap_transpose()
         m["aten.permute.default"] = self._wrap_transpose()
+        m["permute"] = self._wrap_permute_method()
         m["t"] = self._wrap_t()
+        m[torch.transpose] = self._wrap_swap_axes()
+        m["aten.transpose.int"] = self._wrap_swap_axes()
+        m["transpose"] = self._wrap_swap_axes()
+        m["unfold"] = self._wrap_unfold()
+        m["aten.unfold.default"] = self._wrap_unfold()
+        m["to"] = self._wrap_to()
+        m["copy_"] = self._wrap_copy_()
+        m["aten.copy.default"] = self._wrap_copy_()
+        m["aten.copy_.default"] = self._wrap_copy_()
         
         m[torch.reshape] = self._wrap_reshape()
         m["aten.reshape.default"] = self._wrap_reshape()
@@ -155,10 +185,57 @@ class FXGraphTranslator:
         m[torch.mm] = self._wrap_binary(self.ops.mm)
         m["aten.mm.default"] = self._wrap_binary(self.ops.mm)
         m["aten.addmm.default"] = self._wrap_addmm()
+        m[torch.bmm] = self._wrap_binary(self.ops.bmm)
+        m["aten.bmm.default"] = self._wrap_binary(self.ops.bmm)
+        m["bmm"] = self._wrap_binary(self.ops.bmm)
+        m[torch.matmul] = self._wrap_binary(self.ops.matmul)
+        m[operator.matmul] = self._wrap_binary(self.ops.matmul)
+        m["aten.matmul.default"] = self._wrap_binary(self.ops.matmul)
+        m["matmul"] = self._wrap_binary(self.ops.matmul)
         if hasattr(torch, "_C") and hasattr(torch._C, "_nn") and hasattr(torch._C._nn, "linear"):
             m[torch._C._nn.linear] = self._wrap_linear()
         m["aten.linear.default"] = self._wrap_linear()
         m["torch._C._nn.linear"] = self._wrap_linear()
+
+        m[torch.stack] = self._wrap_stack()
+        m["aten.stack.default"] = self._wrap_stack()
+        m["stack"] = self._wrap_stack()
+
+        m[torch.masked_fill] = self._wrap_masked_fill()
+        m["masked_fill"] = self._wrap_masked_fill()
+        m["masked_fill_"] = self._wrap_masked_fill()
+        m["aten.masked_fill.Scalar"] = self._wrap_masked_fill()
+        m["aten.masked_fill_.Scalar"] = self._wrap_masked_fill()
+
+        m[torch.nn.functional.normalize] = self._wrap_normalize()
+        m["aten.normalize.default"] = self._wrap_normalize()
+
+        m[torch.nn.functional.hardtanh] = self._wrap_hardtanh()
+        m["hardtanh"] = self._wrap_hardtanh()
+        m["aten.hardtanh.default"] = self._wrap_hardtanh()
+        m["aten.hardtanh_.default"] = self._wrap_hardtanh()
+        m[torch.nn.functional.relu6] = self._wrap_hardtanh(0.0, 6.0)
+        m["aten.relu6.default"] = self._wrap_hardtanh(0.0, 6.0)
+
+        m[torch.nn.functional.softmax] = self._wrap_softmax(self.ops.softmax)
+        m["softmax"] = self._wrap_softmax(self.ops.softmax)
+        m["aten.softmax.int"] = self._wrap_softmax(self.ops.softmax)
+        m["aten._softmax.default"] = self._wrap_softmax(self.ops.softmax)
+        m[torch.nn.functional.log_softmax] = self._wrap_softmax(self.ops.log_softmax)
+        m["log_softmax"] = self._wrap_softmax(self.ops.log_softmax)
+        m["aten.log_softmax.int"] = self._wrap_softmax(self.ops.log_softmax)
+        m["aten._log_softmax.default"] = self._wrap_softmax(self.ops.log_softmax)
+
+        # Normalization
+        m[torch.nn.functional.layer_norm] = self._wrap_layer_norm()
+        m["layer_norm"] = self._wrap_layer_norm()
+        m["aten.layer_norm.default"] = self._wrap_layer_norm()
+        m["aten.native_layer_norm.default"] = self._wrap_native_layer_norm()
+        m[torch.nn.functional.batch_norm] = self._wrap_functional_batch_norm()
+        m["batch_norm"] = self._wrap_functional_batch_norm()
+        m[torch.batch_norm] = self._wrap_aten_batch_norm()
+        m["aten.batch_norm.default"] = self._wrap_aten_batch_norm()
+        m["aten._native_batch_norm_legit_no_training.default"] = self._wrap_native_batch_norm()
 
         # Convolution
         m[torch.convolution] = self._wrap_convolution()
@@ -225,6 +302,140 @@ class FXGraphTranslator:
             weight = args[1]
             bias = args[2] if len(args) > 2 else node.kwargs.get("bias", None)
             return self.ops.linear(input, weight, bias=bias)
+        return convert
+
+    def _wrap_masked_fill(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            mask = args[1] if len(args) > 1 else kw["mask"]
+            value = args[2] if len(args) > 2 else kw["value"]
+            return self.ops.masked_fill(args[0], mask, value)
+        return convert
+
+    def _wrap_normalize(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            p = args[1] if len(args) > 1 else kw.get("p", 2.0)
+            dim = args[2] if len(args) > 2 else kw.get("dim", 1)
+            eps = args[3] if len(args) > 3 else kw.get("eps", 1e-12)
+            return self.ops.normalize(args[0], float(p), int(dim), float(eps))
+        return convert
+
+    def _wrap_hardtanh(self, min_default=-1.0, max_default=1.0):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            min_val = args[1] if len(args) > 1 else kw.get("min_val", min_default)
+            max_val = args[2] if len(args) > 2 else kw.get("max_val", max_default)
+            return self.ops.hardtanh(args[0], float(min_val), float(max_val))
+        return convert
+
+    def _wrap_softmax(self, op_func):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            dim = args[1] if len(args) > 1 else node.kwargs.get("dim")
+            if dim is None:
+                raise NotImplementedError("softmax without an explicit dim is not implemented")
+            return op_func(args[0], int(dim))
+        return convert
+
+    def _wrap_stack(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            dim = args[1] if len(args) > 1 else node.kwargs.get("dim", 0)
+            return self.ops.stack(args[0], dim=int(dim))
+        return convert
+
+    def _wrap_layer_norm(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+
+            def pick(index, name, default=None):
+                return args[index] if len(args) > index else kw.get(name, default)
+
+            return self.ops.layer_norm(
+                args[0],
+                pick(1, "normalized_shape"),
+                weight=pick(2, "weight"),
+                bias=pick(3, "bias"),
+                eps=pick(4, "eps", 1e-5),
+            )
+        return convert
+
+    def _wrap_native_layer_norm(self):
+        """`aten.native_layer_norm` yields `(out, mean, rstd)`; only the output is materialized."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            out = self.ops.layer_norm(
+                args[0],
+                args[1] if len(args) > 1 else kw["normalized_shape"],
+                weight=args[2] if len(args) > 2 else kw.get("weight"),
+                bias=args[3] if len(args) > 3 else kw.get("bias"),
+                eps=args[4] if len(args) > 4 else kw.get("eps", 1e-5),
+            )
+            return self.world.tuple([out, out, out])
+        return convert
+
+    def _wrap_functional_batch_norm(self):
+        """`F.batch_norm(input, running_mean, running_var, weight, bias, training, momentum, eps)`."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+
+            def pick(index, name, default=None):
+                return args[index] if len(args) > index else kw.get(name, default)
+
+            return self.ops.batch_norm(
+                args[0],
+                weight=pick(3, "weight"),
+                bias=pick(4, "bias"),
+                running_mean=pick(1, "running_mean"),
+                running_var=pick(2, "running_var"),
+                training=pick(5, "training", False),
+                eps=pick(7, "eps", 1e-5),
+            )
+        return convert
+
+    def _wrap_aten_batch_norm(self):
+        """`aten.batch_norm(input, weight, bias, running_mean, running_var, training, momentum, eps, ...)`."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+
+            def pick(index, name, default=None):
+                return args[index] if len(args) > index else kw.get(name, default)
+
+            return self.ops.batch_norm(
+                args[0],
+                weight=pick(1, "weight"),
+                bias=pick(2, "bias"),
+                running_mean=pick(3, "running_mean"),
+                running_var=pick(4, "running_var"),
+                training=pick(5, "training", False),
+                eps=pick(7, "eps", 1e-5),
+            )
+        return convert
+
+    def _wrap_native_batch_norm(self):
+        """`aten._native_batch_norm_legit_no_training` yields `(out, save_mean, save_invstd)`.
+
+        Only the normalized output is materialized; the saved statistics exist for the backward pass."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            out = self.ops.batch_norm(
+                args[0],
+                weight=args[1] if len(args) > 1 else kw.get("weight"),
+                bias=args[2] if len(args) > 2 else kw.get("bias"),
+                running_mean=args[3] if len(args) > 3 else kw.get("running_mean"),
+                running_var=args[4] if len(args) > 4 else kw.get("running_var"),
+                eps=args[6] if len(args) > 6 else kw.get("eps", 1e-5),
+            )
+            return self.world.tuple([out, out, out])
         return convert
 
     def _wrap_convolution(self):
@@ -394,6 +605,58 @@ class FXGraphTranslator:
             return self.ops.transpose(args[0], [1, 0])
         return convert
 
+    def _wrap_permute_method(self):
+        """`x.permute(0, 2, 1)` and `x.permute([0, 2, 1])` both reach here."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            rest = args[1:]
+            permutation = list(rest[0]) if len(rest) == 1 and isinstance(rest[0], (list, tuple)) else list(rest)
+            return self.ops.transpose(args[0], permutation)
+        return convert
+
+    def _wrap_swap_axes(self):
+        """`transpose(dim0, dim1)` swaps two axes, unlike `permute`, which takes the whole permutation."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            rank = len(self.ops.shape_of(x))
+            dim0, dim1 = (int(d) % rank for d in args[1:3])
+            permutation = list(range(rank))
+            permutation[dim0], permutation[dim1] = permutation[dim1], permutation[dim0]
+            return self.ops.transpose(x, permutation)
+        return convert
+
+    def _wrap_unfold(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            dim = args[1] if len(args) > 1 else kw["dimension"]
+            size = args[2] if len(args) > 2 else kw["size"]
+            step = args[3] if len(args) > 3 else kw["step"]
+            return self.ops.unfold(args[0], int(dim), int(size), int(step))
+        return convert
+
+    def _wrap_to(self):
+        """`Tensor.to`: a device move is nothing here, a dtype change goes through the cast."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            targets = [a for a in list(args[1:]) + list(node.kwargs.values()) if isinstance(a, torch.dtype)]
+            if not targets:
+                return args[0]
+            return self.ops.convert_element_type(args[0], targets[0])
+        return convert
+
+    def _wrap_copy_(self):
+        """`dst.copy_(src)` reads back as `src`; the graph is functional, so the write is the value."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            dst, src = args[0], args[1]
+            dst_dims, src_dims = self.ops.shape_of(dst), self.ops.shape_of(src)
+            if not self.ops.rules.same_shape(dst_dims, src_dims):
+                raise NotImplementedError("copy_ with a broadcasting source is not implemented")
+            return src
+        return convert
+
     def _wrap_transpose(self):
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
@@ -559,7 +822,7 @@ class FXGraphTranslator:
                 dim = args[1]
                 if isinstance(dim, int):
                     return dims[dim]
-                return dims[dim.get_nat()] if hasattr(dim, "get_nat") else dims[dim]
+                return dims[lit_nat_value(dim)]
             return dims
         return convert
 
@@ -643,7 +906,7 @@ class FXGraphTranslator:
 
         old_sym_map = self.ops.sym_map
         num_params = len(input_types) + 1
-        dom_with_ret = self.world.mut_sigma(num_params)
+        dom_with_ret = self.world.mut_sigma(self.world.type(self.world.lit_univ_0()), num_params)
 
         for i in range(num_sym):
             dom_with_ret.set(i, self.world.type_nat())

@@ -3,6 +3,17 @@ from dataclasses import dataclass
 import mim
 
 
+def lit_nat_value(dim: mim.Def):
+    """The extent a `Nat` literal denotes, or `None` for anything else.
+
+    `Lit` exposes no value accessor, but `num_projs` of an array over @p dim does.
+    The `Lit` check is what keeps `top_nat` - which would report 1 - out."""
+    if not isinstance(dim, mim.Lit):
+        return None
+    world = dim.world()
+    return world.arr(dim, world.type_nat()).num_projs()
+
+
 @dataclass(frozen=True)
 class ReduceShapeSpec:
     reduce_dims: list[int]
@@ -21,12 +32,12 @@ class ShapeRules:
         self.world = world
 
     def _dim_literal_value(self, dim: mim.Def):
-        if isinstance(dim, mim.Lit) and hasattr(dim, "get_nat"):
-            return dim.get_nat()
-        return None
+        return lit_nat_value(dim)
 
     def _is_dim_one(self, dim: mim.Def):
-        return self._dim_literal_value(dim) == 1
+        # Compare against the literal rather than reading a value out of it: the
+        # binding gives Lit no accessor, but the World is hash-consed.
+        return dim == self.world.lit_nat(1)
 
     def _same_dim(self, lhs: mim.Def, rhs: mim.Def):
         lhs_value = self._dim_literal_value(lhs)

@@ -1,4 +1,6 @@
 import mim
+
+from mimir_frontend.shape_rules import lit_nat_value
 import torch
 from torch import fx
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -17,7 +19,7 @@ def tensor_shape_values(tensor_def):
     tensor_type = tensor_def.type()
     while isinstance(tensor_type, mim.Seq):
         dim = tensor_type.arity()
-        dims.append(dim.get_nat() if isinstance(dim, mim.Lit) else None)
+        dims.append(lit_nat_value(dim))
         tensor_type = tensor_type.body()
     return dims
 
