@@ -168,6 +168,13 @@ class FXGraphTranslator:
         m["aten.linear.default"] = self._wrap_linear()
         m["torch._C._nn.linear"] = self._wrap_linear()
 
+        # Normalization
+        m[torch.nn.functional.batch_norm] = self._wrap_functional_batch_norm()
+        m["batch_norm"] = self._wrap_functional_batch_norm()
+        m[torch.batch_norm] = self._wrap_aten_batch_norm()
+        m["aten.batch_norm.default"] = self._wrap_aten_batch_norm()
+        m["aten._native_batch_norm_legit_no_training.default"] = self._wrap_native_batch_norm()
+
         # Convolution
         m[torch.convolution] = self._wrap_convolution()
         if hasattr(torch, "conv2d"):
@@ -233,6 +240,64 @@ class FXGraphTranslator:
             weight = args[1]
             bias = args[2] if len(args) > 2 else node.kwargs.get("bias", None)
             return self.ops.linear(input, weight, bias=bias)
+        return convert
+
+    def _wrap_functional_batch_norm(self):
+        """`F.batch_norm(input, running_mean, running_var, weight, bias, training, momentum, eps)`."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+
+            def pick(index, name, default=None):
+                return args[index] if len(args) > index else kw.get(name, default)
+
+            return self.ops.batch_norm(
+                args[0],
+                weight=pick(3, "weight"),
+                bias=pick(4, "bias"),
+                running_mean=pick(1, "running_mean"),
+                running_var=pick(2, "running_var"),
+                training=pick(5, "training", False),
+                eps=pick(7, "eps", 1e-5),
+            )
+        return convert
+
+    def _wrap_aten_batch_norm(self):
+        """`aten.batch_norm(input, weight, bias, running_mean, running_var, training, momentum, eps, ...)`."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+
+            def pick(index, name, default=None):
+                return args[index] if len(args) > index else kw.get(name, default)
+
+            return self.ops.batch_norm(
+                args[0],
+                weight=pick(1, "weight"),
+                bias=pick(2, "bias"),
+                running_mean=pick(3, "running_mean"),
+                running_var=pick(4, "running_var"),
+                training=pick(5, "training", False),
+                eps=pick(7, "eps", 1e-5),
+            )
+        return convert
+
+    def _wrap_native_batch_norm(self):
+        """`aten._native_batch_norm_legit_no_training` yields `(out, save_mean, save_invstd)`.
+
+        Only the normalized output is materialized; the saved statistics exist for the backward pass."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            out = self.ops.batch_norm(
+                args[0],
+                weight=args[1] if len(args) > 1 else kw.get("weight"),
+                bias=args[2] if len(args) > 2 else kw.get("bias"),
+                running_mean=args[3] if len(args) > 3 else kw.get("running_mean"),
+                running_var=args[4] if len(args) > 4 else kw.get("running_var"),
+                eps=args[6] if len(args) > 6 else kw.get("eps", 1e-5),
+            )
+            return self.world.tuple([out, out, out])
         return convert
 
     def _wrap_convolution(self):

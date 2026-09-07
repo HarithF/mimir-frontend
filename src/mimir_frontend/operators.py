@@ -758,13 +758,15 @@ class OperatorLibrary:
     def linear(self, input, weight, bias=None):
         input_dims = self.shape_of(input)
         weight_dims = self.shape_of(weight)
-        if len(input_dims) != 2 or len(weight_dims) != 2:
-            raise NotImplementedError("linear currently supports 2D input and 2D weight only")
+        if len(weight_dims) != 2:
+            raise NotImplementedError("linear currently supports a 2D weight only")
+        if not self.rules._same_dim(input_dims[-1], weight_dims[1]):
+            raise NotImplementedError("linear weight in_features must match input features")
+        if len(input_dims) != 2:
+            return self._batched_linear(input, weight, bias, input_dims, weight_dims[0])
 
         in_features = input_dims[1]
         out_features = weight_dims[0]
-        if weight_dims[1] != in_features:
-            raise NotImplementedError("linear weight in_features must match input features")
 
         transposed_weight = self.transpose(weight, [1, 0])
         if bias is None:
@@ -775,6 +777,48 @@ class OperatorLibrary:
             bias_expanded = self.repeat(bias_row, [batch, out_features])
             result = self.add(self.mm(input, transposed_weight), bias_expanded)
         return self._remember_shape(result, [input_dims[0], out_features])
+
+    def _batched_linear(self, input, weight, bias, input_dims, out_features):
+        """`linear` over a leading batch prefix: contract the trailing axis, then add the bias per output."""
+        result = self.matmul(input, self.transpose(weight, [1, 0]))
+        out_dims = list(input_dims[:-1]) + [out_features]
+        result = self._remember_shape(result, out_dims)
+        if bias is None:
+            return result
+
+        bias_shape = [self.world.lit_nat(1)] * (len(out_dims) - 1) + [out_features]
+        return self._remember_shape(self.add(result, self.reshape(bias, bias_shape)), out_dims)
+
+    def batch_norm(self, input, weight=None, bias=None, running_mean=None, running_var=None,
+                   training=False, eps=1e-5):
+        """`(x - mean) * rsqrt(var + eps) * weight + bias`, per channel.
+
+        Only the inference form: the batch statistics of a training-mode norm would have to be
+        reduced out of `input` first."""
+        if training:
+            raise NotImplementedError("batch_norm in training mode is not implemented")
+        if running_mean is None or running_var is None:
+            raise NotImplementedError("batch_norm without running statistics is not implemented")
+
+        dims = self.shape_of(input)
+        if len(dims) < 2:
+            raise NotImplementedError("batch_norm expects an input with a channel axis")
+        channels = dims[1]
+
+        # Fold weight into the scale and mean into the shift, so the input is touched twice.
+        scale = self.rsqrt(self.add(running_var, float(eps)))
+        if weight is not None:
+            scale = self.mul(scale, weight)
+        shift = self.mul(running_mean, scale)
+
+        per_channel = [channels if i == 1 else self.world.lit_nat(1) for i in range(len(dims))]
+        result = self.sub(
+            self.mul(input, self.reshape(scale, per_channel)),
+            self.reshape(shift, per_channel),
+        )
+        if bias is not None:
+            result = self.add(result, self.reshape(bias, per_channel))
+        return self._remember_shape(result, dims)
 
     def _is_one_group(self, groups):
         if isinstance(groups, int): return groups == 1

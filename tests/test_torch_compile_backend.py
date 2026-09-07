@@ -289,3 +289,54 @@ def test_matmul_matches_eager(lhs_shape, rhs_shape):
 def test_grouped_conv_matches_eager(groups):
     """`groups == 6` is the depthwise case, where every channel is its own group."""
     check_against_eager(GroupedConv(groups), torch.randn(2, 6, 8, 8))
+
+
+class BatchNormNet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 8, 3, padding=1)
+        self.bn = torch.nn.BatchNorm2d(8)
+
+    def forward(self, x):
+        return torch.relu(self.bn(self.conv(x)))
+
+
+class BatchNormNoAffine(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bn = torch.nn.BatchNorm2d(4, affine=False)
+
+    def forward(self, x):
+        return self.bn(x)
+
+
+class BatchedLinear(torch.nn.Module):
+    def __init__(self, bias=True):
+        super().__init__()
+        self.fc = torch.nn.Linear(8, 5, bias=bias)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+def test_batch_norm_matches_eager():
+    model = BatchNormNet().eval()
+    # Give the running statistics something other than their 0/1 initialization.
+    with torch.no_grad():
+        model.bn.running_mean.normal_()
+        model.bn.running_var.uniform_(0.5, 2.0)
+    check_against_eager(model, torch.randn(2, 3, 8, 8))
+
+
+def test_batch_norm_without_affine_matches_eager():
+    model = BatchNormNoAffine().eval()
+    with torch.no_grad():
+        model.bn.running_mean.normal_()
+        model.bn.running_var.uniform_(0.5, 2.0)
+    check_against_eager(model, torch.randn(2, 4, 5, 5))
+
+
+@pytest.mark.parametrize("shape", [(4, 8), (2, 4, 8), (2, 3, 4, 8)])
+@pytest.mark.parametrize("bias", [True, False])
+def test_batched_linear_matches_eager(shape, bias):
+    check_against_eager(BatchedLinear(bias).eval(), torch.randn(*shape))
