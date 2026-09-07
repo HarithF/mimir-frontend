@@ -691,6 +691,70 @@ class OperatorLibrary:
         callee = self.world.app(callee, ring)
         return self.world.implicit_app(callee, [lhs, rhs])
 
+    def bmm(self, lhs, rhs):
+        lhs_dims = self.shape_of(lhs)
+        rhs_dims = self.shape_of(rhs)
+        # Composite graphs expose folded operands on either side; matmul owns the broadcast semantics.
+        if len(lhs_dims) != 3 or len(rhs_dims) != 3:
+            return self.matmul(lhs, rhs)
+        if not self.rules._same_dim(lhs_dims[0], rhs_dims[0]):
+            return self.matmul(lhs, rhs)
+        if not self.rules._same_dim(lhs_dims[2], rhs_dims[1]):
+            raise NotImplementedError("aten.bmm contraction extents do not match")
+
+        ring = self.world.tuple([self.F32, self._f32_float_lit(0.0), self.f32_add_axm, self.f32_mul_axm])
+        callee = self.world.app(self.world.annex(tensor.bmm.value), ring)
+        result = self.world.implicit_app(callee, [lhs, rhs])
+        return self._remember_shape(result, [lhs_dims[0], lhs_dims[1], rhs_dims[2]])
+
+    def matmul(self, lhs, rhs):
+        """`torch.matmul`: the 1-D/2-D cases plus a batched product over a broadcast batch prefix."""
+        lhs_dims = self.shape_of(lhs)
+        rhs_dims = self.shape_of(rhs)
+        lhs_rank, rhs_rank = len(lhs_dims), len(rhs_dims)
+
+        if lhs_rank == 0 or rhs_rank == 0:
+            raise NotImplementedError("torch.matmul requires operands of rank >= 1")
+        if lhs_rank == 1 and rhs_rank == 1:
+            # The rank-0 result would collapse out of its own type; see the size-1 axis caveat.
+            raise NotImplementedError("torch.matmul of two 1-D operands is not implemented")
+
+        # A 1-D operand acts as a matrix with a prepended (lhs) or appended (rhs) singleton that is dropped
+        # again. Only the appended one survives: a leading size-1 axis collapses out of the Mim type, and
+        # `«1, k; T»` then unifies against `«m, k; T»` with `m = k`. `v @ M` is `Mᵀ @ v`, which needs none.
+        if lhs_rank == 1:
+            if rhs_rank != 2:
+                raise NotImplementedError("torch.matmul with a 1-D lhs needs a 2-D rhs")
+            return self.matmul(self.transpose(rhs, [1, 0]), lhs)
+        if rhs_rank == 1:
+            out = self.matmul(lhs, self.reshape(rhs, [rhs_dims[0], self.world.lit_nat(1)]))
+            return self.reshape(out, self.shape_of(out)[:-1])
+
+        if not self.rules._same_dim(lhs_dims[-1], rhs_dims[-2]):
+            raise NotImplementedError("torch.matmul contraction extents do not match")
+
+        rows, contract = lhs_dims[-2:]
+        cols = rhs_dims[-1]
+        if lhs_rank == 2 and rhs_rank == 2:
+            return self._remember_shape(self.mm(lhs, rhs), [rows, cols])
+
+        batch = self.rules.broadcast_shape(lhs_dims[:-2], rhs_dims[:-2])
+        flat = self._nat_product(batch)
+        lhs3 = self.reshape(self._broadcast_batch(lhs, batch, [rows, contract]), [flat, rows, contract])
+        rhs3 = self.reshape(self._broadcast_batch(rhs, batch, [contract, cols]), [flat, contract, cols])
+        return self.reshape(self.bmm(lhs3, rhs3), list(batch) + [rows, cols])
+
+    def _broadcast_batch(self, x, batch, tail):
+        """Expands @p x's batch prefix to @p batch, keeping its trailing @p tail dims."""
+        have = self.shape_of(x)[: -len(tail)]
+        if self.rules.same_shape(have, batch):
+            return x
+        # Right-align the existing prefix under `batch`, then tile the singleton axes out.
+        padded = [self.world.lit_nat(1)] * (len(batch) - len(have)) + list(have)
+        if len(padded) != len(have):
+            x = self.reshape(x, padded + list(tail))
+        return self.repeat(x, list(batch) + list(tail))
+
     def linear(self, input, weight, bias=None):
         input_dims = self.shape_of(input)
         weight_dims = self.shape_of(weight)
@@ -712,9 +776,63 @@ class OperatorLibrary:
             result = self.add(self.mm(input, transposed_weight), bias_expanded)
         return self._remember_shape(result, [input_dims[0], out_features])
 
+    def _is_one_group(self, groups):
+        if isinstance(groups, int): return groups == 1
+        return self._is_lit_nat_value(groups, 1)
+
+    def _slice_dim(self, x, dim, start, length):
+        """`%tensor.slice` along one axis with `Nat` bounds; `slice` needs Python ints."""
+        rank, in_shape_tuple = self._rank_and_shape(x)
+        in_dims = self.shape_of(x)
+        zero, one = self.world.lit_nat(0), self.world.lit_nat(1)
+
+        starts, steps = [zero] * len(in_dims), [one] * len(in_dims)
+        starts[dim] = self._to_nat(start)
+        out_dims = list(in_dims)
+        out_dims[dim] = self._to_nat(length)
+
+        callee = self.world.annex(tensor.slice.value)
+        callee = self._apply_grouped(callee, [self._tensor_element_type(x), rank])
+        callee = self.world.app(callee, in_shape_tuple)
+        callee = self.world.app(
+            callee,
+            self.world.tuple(
+                [self.world.tuple(starts), self.world.tuple(steps), self.world.tuple(out_dims)]
+            ),
+        )
+        return self._remember_shape(self.world.app(callee, x), out_dims)
+
+    def _grouped_convolution(self, x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        """Grouped conv as `groups` independent convs over channel slices, re-joined on the channel axis.
+
+        %tensor.conv is defined for `groups = 1` only, and the alternative - one map_reduce whose read map
+        derives the group from `co floordiv cout_per_group` - puts a division back into the access map.
+        The per-group extents stay `Nat` expressions; %core.nat folds them when the channels are literal."""
+        if not isinstance(groups, int) or groups < 1:
+            raise NotImplementedError("aten.convolution needs a literal group count")
+
+        cin_per = self.nat_floordiv(self.shape_of(x)[1], groups)
+        cout_per = self.nat_floordiv(self.shape_of(weight)[0], groups)
+
+        parts = []
+        for g in range(groups):
+            x_g = self._slice_dim(x, 1, self._nat_binop(core.nat.mul, g, cin_per), cin_per)
+            w_g = self._slice_dim(weight, 0, self._nat_binop(core.nat.mul, g, cout_per), cout_per)
+            parts.append(self.convolution(x_g, w_g, stride=stride, padding=padding, dilation=dilation))
+
+        result = self.cat(self.world.tuple(parts), dim=1)
+        if bias is None:
+            return result
+
+        out_dims = self.shape_of(result)
+        bias_shape = [dim if dim == out_dims[1] else self.world.lit_nat(1) for dim in out_dims]
+        return self._remember_shape(self.add(result, self.reshape(bias, bias_shape)), out_dims)
+
     def convolution(self, x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-        if groups != 1:
-            raise NotImplementedError("aten.convolution with groups != 1 is not implemented")
+        if not self._is_one_group(groups):
+            return self._grouped_convolution(
+                x, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups
+            )
 
         semantic_in_dims = self.shape_of(x)
         weight_dims = self.shape_of(weight)

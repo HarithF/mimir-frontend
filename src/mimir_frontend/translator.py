@@ -155,6 +155,13 @@ class FXGraphTranslator:
         m[torch.mm] = self._wrap_binary(self.ops.mm)
         m["aten.mm.default"] = self._wrap_binary(self.ops.mm)
         m["aten.addmm.default"] = self._wrap_addmm()
+        m[torch.bmm] = self._wrap_binary(self.ops.bmm)
+        m["aten.bmm.default"] = self._wrap_binary(self.ops.bmm)
+        m["bmm"] = self._wrap_binary(self.ops.bmm)
+        m[torch.matmul] = self._wrap_binary(self.ops.matmul)
+        m[operator.matmul] = self._wrap_binary(self.ops.matmul)
+        m["aten.matmul.default"] = self._wrap_binary(self.ops.matmul)
+        m["matmul"] = self._wrap_binary(self.ops.matmul)
         if hasattr(torch, "_C") and hasattr(torch._C, "_nn") and hasattr(torch._C._nn, "linear"):
             m[torch._C._nn.linear] = self._wrap_linear()
         m["aten.linear.default"] = self._wrap_linear()

@@ -244,3 +244,48 @@ def test_fast_math_separates_cache_entries(tmp_path):
             torch.testing.assert_close(compiled(x), model(x), rtol=1e-4, atol=1e-4)
 
     assert len({p.name for p in tmp_path.glob("*.so")}) == 2
+
+
+class Bmm(torch.nn.Module):
+    def forward(self, lhs, rhs):
+        return torch.bmm(lhs, rhs)
+
+
+class Matmul(torch.nn.Module):
+    def forward(self, lhs, rhs):
+        return torch.matmul(lhs, rhs)
+
+
+class GroupedConv(torch.nn.Module):
+    def __init__(self, groups):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(6, 12, 3, padding=1, groups=groups)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+def test_bmm_matches_eager():
+    check_against_eager(Bmm(), torch.randn(3, 4, 5), torch.randn(3, 5, 2))
+
+
+@pytest.mark.parametrize(
+    "lhs_shape,rhs_shape",
+    [
+        ((4, 8), (8, 3)),        # 2-D x 2-D
+        ((2, 4, 8), (2, 8, 3)),  # batched, matching prefix
+        ((2, 4, 8), (8, 3)),     # batched x plain matrix
+        ((2, 3, 4, 8), (8, 5)),  # two batch dims
+        ((1, 4, 8), (2, 8, 3)),  # broadcast the batch prefix
+        ((8,), (8, 3)),          # 1-D lhs is promoted then dropped
+        ((4, 8), (8,)),          # 1-D rhs is promoted then dropped
+    ],
+)
+def test_matmul_matches_eager(lhs_shape, rhs_shape):
+    check_against_eager(Matmul(), torch.randn(*lhs_shape), torch.randn(*rhs_shape))
+
+
+@pytest.mark.parametrize("groups", [2, 3, 6])
+def test_grouped_conv_matches_eager(groups):
+    """`groups == 6` is the depthwise case, where every channel is its own group."""
+    check_against_eager(GroupedConv(groups), torch.randn(2, 6, 8, 8))
