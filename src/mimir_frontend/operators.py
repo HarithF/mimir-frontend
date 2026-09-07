@@ -870,19 +870,10 @@ class OperatorLibrary:
         result = self._remember_shape(result, out_dims)
 
         if bias is not None:
-            add_dims = self._shape_dims(result)
-            bias_shape = []
-            for dim in add_dims:
-                if dim == cout:
-                    bias_shape.append(cout)
-                else:
-                    bias_shape.append(1)
-            if not bias_shape:
-                bias_shape = [cout]
-            bias = self.reshape(bias, bias_shape)
-            self._remember_shape(result, add_dims)
-            result = self.add(result, bias)
-            self._remember_shape(result, out_dims)
+            # Positional: matching the channel extent by value also caught a spatial axis of the same size.
+            per_channel = [cout if i == 1 else self.world.lit_nat(1) for i in range(len(out_dims))]
+            result = self.add(result, self.reshape(bias, per_channel))
+            result = self._remember_shape(result, out_dims)
         return result
 
     def _to_nat(self, value):
