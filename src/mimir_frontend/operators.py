@@ -584,9 +584,37 @@ class OperatorLibrary:
         return lam
 
     def mean(self, input, dim=None, keepdim=False):
-        """
-        Translates to mean reduction.
-        """
+        """`sum` over a scalar accumulator, divided by the reduced extent.
+
+        Falls back to the `(sum, count)` accumulator when an extent is not literal: that one does
+        not bufferize, but it is the only way to count a symbolic extent."""
+        dims = self.shape_of(input)
+        axes = self.rules.normalize_reduce_dims(dim, len(dims))
+
+        # A reduction over every axis leaves nothing for the elementwise divide to range over.
+        if len(axes) == len(dims):
+            return self._mean_pairwise(input, dim=dim, keepdim=keepdim)
+
+        count = 1
+        for axis in axes:
+            extent = lit_nat_value(dims[axis])
+            if extent is None:
+                return self._mean_pairwise(input, dim=dim, keepdim=keepdim)
+            count *= extent
+
+        # Divide before restoring the reduced axes: a size-1 axis collapses out of the type, and the
+        # elementwise divide would then disagree with the remembered rank.
+        averaged = self.div(self.sum(input, dim=dim, keepdim=False), float(count))
+        if not keepdim:
+            return averaged
+
+        kept = [self.world.lit_nat(1) if i in axes else d for i, d in enumerate(dims)]
+        return self.reshape(averaged, kept)
+
+    def _mean_pairwise(self, input, dim=None, keepdim=False):
+        """Mean through a `(sum, count)` accumulator, which counts a non-literal extent at run time.
+
+        The accumulator makes the reduction's element type an array, which does not bufferize."""
         pair_type = self.world.arr(self.world.lit_nat(2), self.F32)
         reduced, output_dims = self._reduce_aff(
             input,
@@ -894,6 +922,32 @@ class OperatorLibrary:
         shifted = self.sub(input, self._broadcast_reduced(self.amax(input, dim=axes), dims, axes))
         total = self._broadcast_reduced(self.log(self.sum(self.exp(shifted), dim=axes)), dims, axes)
         return self._remember_shape(self.sub(shifted, total), dims)
+
+    def masked_fill(self, input, mask, value):
+        """`torch.masked_fill`: @p value where @p mask holds, @p input elsewhere.
+
+        The filler is built elementwise from @p input rather than with `full`, whose zero-input
+        `%tensor.map` does not typecheck."""
+        dims = self.shape_of(input)
+        filler = self.add(self.mul(input, 0.0), float(value))
+        return self._remember_shape(self.where(mask, filler, input), dims)
+
+    def normalize(self, input, p=2.0, dim=1, eps=1e-12):
+        """`F.normalize`: divide by the p-norm along @p dim, floored at @p eps."""
+        dims = self.shape_of(input)
+        if dim < 0:
+            dim += len(dims)
+        axes = [dim]
+
+        if float(p) == 2.0:
+            norm = self.sqrt(self.sum(self.mul(input, input), dim=axes))
+        elif float(p) == 1.0:
+            norm = self.sum(self.abs(input), dim=axes)
+        else:
+            raise NotImplementedError(f"F.normalize with p={p} is not implemented")
+
+        floored = self.clamp_min(norm, float(eps))
+        return self._remember_shape(self.div(input, self._broadcast_reduced(floored, dims, axes)), dims)
 
     def hardtanh(self, input, min_val=-1.0, max_val=1.0):
         """`nn.ReLU6` reaches us as `hardtanh(x, 0, 6)`."""

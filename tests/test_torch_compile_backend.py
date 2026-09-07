@@ -477,3 +477,61 @@ def test_hardtanh_custom_bounds_matches_eager():
 @pytest.mark.parametrize("dim", [0, 1, 2, -1])
 def test_softmax_matches_eager(dim, log):
     check_against_eager(Softmax(dim, log), torch.randn(2, 3, 4))
+
+
+class MaskedFill(torch.nn.Module):
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+    def forward(self, x, mask):
+        return x.masked_fill(mask == 0, self.value)
+
+
+class CausalAttentionShape(torch.nn.Module):
+    """masked_fill with -inf followed by softmax, as a causal attention does."""
+
+    def forward(self, att, mask):
+        att = att.masked_fill(mask == 0, float("-inf"))
+        return torch.nn.functional.softmax(att, dim=-1)
+
+
+class Normalize(torch.nn.Module):
+    def __init__(self, p, dim):
+        super().__init__()
+        self.p, self.dim = p, dim
+
+    def forward(self, x):
+        return torch.nn.functional.normalize(x, p=self.p, dim=self.dim)
+
+
+class Mean(torch.nn.Module):
+    def __init__(self, dim, keepdim):
+        super().__init__()
+        self.dim, self.keepdim = dim, keepdim
+
+    def forward(self, x):
+        return torch.mean(x, dim=self.dim, keepdim=self.keepdim)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.5])
+def test_masked_fill_matches_eager(value):
+    mask = (torch.rand(2, 4) > 0.5).float()
+    check_against_eager(MaskedFill(value), torch.randn(2, 4), mask)
+
+
+def test_causal_mask_then_softmax_matches_eager():
+    mask = torch.tril(torch.ones(4, 4))
+    check_against_eager(CausalAttentionShape(), torch.randn(2, 4, 4), mask)
+
+
+@pytest.mark.parametrize("p", [1.0, 2.0])
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_normalize_matches_eager(p, dim):
+    check_against_eager(Normalize(p, dim), torch.randn(3, 5) + 0.5)
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_mean_matches_eager(dim, keepdim):
+    check_against_eager(Mean(dim, keepdim), torch.randn(2, 3, 4))

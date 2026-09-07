@@ -201,6 +201,15 @@ class FXGraphTranslator:
         m["aten.stack.default"] = self._wrap_stack()
         m["stack"] = self._wrap_stack()
 
+        m[torch.masked_fill] = self._wrap_masked_fill()
+        m["masked_fill"] = self._wrap_masked_fill()
+        m["masked_fill_"] = self._wrap_masked_fill()
+        m["aten.masked_fill.Scalar"] = self._wrap_masked_fill()
+        m["aten.masked_fill_.Scalar"] = self._wrap_masked_fill()
+
+        m[torch.nn.functional.normalize] = self._wrap_normalize()
+        m["aten.normalize.default"] = self._wrap_normalize()
+
         m[torch.nn.functional.hardtanh] = self._wrap_hardtanh()
         m["hardtanh"] = self._wrap_hardtanh()
         m["aten.hardtanh.default"] = self._wrap_hardtanh()
@@ -293,6 +302,25 @@ class FXGraphTranslator:
             weight = args[1]
             bias = args[2] if len(args) > 2 else node.kwargs.get("bias", None)
             return self.ops.linear(input, weight, bias=bias)
+        return convert
+
+    def _wrap_masked_fill(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            mask = args[1] if len(args) > 1 else kw["mask"]
+            value = args[2] if len(args) > 2 else kw["value"]
+            return self.ops.masked_fill(args[0], mask, value)
+        return convert
+
+    def _wrap_normalize(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            p = args[1] if len(args) > 1 else kw.get("p", 2.0)
+            dim = args[2] if len(args) > 2 else kw.get("dim", 1)
+            eps = args[3] if len(args) > 3 else kw.get("eps", 1e-12)
+            return self.ops.normalize(args[0], float(p), int(dim), float(eps))
         return convert
 
     def _wrap_hardtanh(self, min_default=-1.0, max_default=1.0):
