@@ -4,8 +4,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MIMIR_DIR="${ROOT_DIR}/MimIR"
 BUILD_DIR="${MIMIR_DIR}/build"
+MLIR_PLUGIN_DIR="${MIMIR_DIR}/extra/mim_mlir"
+MLIR_PLUGIN_URL="${MIM_MLIR_URL:-https://github.com/HarithF/mim_mlir.git}"
 
 git -C "${ROOT_DIR}" submodule update --init --recursive
+
+# MimIR globs extra/*/CMakeLists.txt at configure time, so the plugin has to be in place
+# before the cmake call below for `mim_all_plugins` (and thus `mim_py`) to build it.
+if [[ -d "${MLIR_PLUGIN_DIR}/.git" ]]; then
+    echo "mim_mlir already checked out in ${MLIR_PLUGIN_DIR}; leaving it untouched"
+else
+    git clone "${MLIR_PLUGIN_URL}" "${MLIR_PLUGIN_DIR}"
+fi
 
 if [[ ! -d "${ROOT_DIR}/.venv" ]]; then
     uv venv --python 3.14
