@@ -340,3 +340,50 @@ def test_batch_norm_without_affine_matches_eager():
 @pytest.mark.parametrize("bias", [True, False])
 def test_batched_linear_matches_eager(shape, bias):
     check_against_eager(BatchedLinear(bias).eval(), torch.randn(*shape))
+
+
+class PermuteMethod(torch.nn.Module):
+    def forward(self, x):
+        return x.permute(0, 2, 1) + 1.0
+
+
+class TransposeMethod(torch.nn.Module):
+    def forward(self, x):
+        return x.transpose(1, 2) * 2.0
+
+
+class TransposeNegativeDims(torch.nn.Module):
+    def forward(self, x):
+        return x.transpose(-1, -2) * 2.0
+
+
+class UnfoldPatches(torch.nn.Module):
+    """The ViT patch-extraction shape: two non-overlapping unfolds."""
+
+    def forward(self, x):
+        return x.unfold(2, 2, 2).unfold(3, 2, 2) + 0.5
+
+
+class ToDtype(torch.nn.Module):
+    def forward(self, x):
+        return x.to(torch.float32) + 1.0
+
+
+def test_permute_method_matches_eager():
+    check_against_eager(PermuteMethod(), torch.randn(2, 3, 4))
+
+
+def test_transpose_method_matches_eager():
+    check_against_eager(TransposeMethod(), torch.randn(2, 3, 4))
+
+
+def test_transpose_negative_dims_matches_eager():
+    check_against_eager(TransposeNegativeDims(), torch.randn(2, 3, 4))
+
+
+def test_unfold_matches_eager():
+    check_against_eager(UnfoldPatches(), torch.randn(2, 3, 4, 4))
+
+
+def test_to_dtype_matches_eager():
+    check_against_eager(ToDtype(), torch.randn(2, 4))

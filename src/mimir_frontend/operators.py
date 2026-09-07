@@ -6,7 +6,7 @@ from mim._plugins.tensor import tensor
 from mim._plugins.core import core, _core_bit1, _core_bit2
 
 from .fastmath import Mode, parse_mode
-from .shape_rules import ShapeRules
+from .shape_rules import ShapeRules, lit_nat_value
 from . import expr
 
 class OperatorLibrary:
@@ -1227,6 +1227,27 @@ class OperatorLibrary:
         callee = self.world.app(callee, self.world.tuple(input_shapes))
         result = self.world.app(callee, tensors)
         return self._remember_shape(result, out_dims)
+
+    def unfold(self, x, dim, size, step):
+        """`Tensor.unfold`: window @p dim, appending the window as the last axis.
+
+        Only the non-overlapping case, where the windows tile the axis exactly; a strided window
+        would need a read map rather than a reshape."""
+        dims = self.shape_of(x)
+        rank = len(dims)
+        if dim < 0:
+            dim += rank
+        if size != step:
+            raise NotImplementedError("unfold with step != size is not implemented")
+
+        extent = lit_nat_value(dims[dim])
+        if extent is None or extent % size:
+            raise NotImplementedError("unfold needs a literal axis extent divisible by the window")
+
+        split = list(dims)
+        split[dim : dim + 1] = [self.world.lit_nat(extent // size), self.world.lit_nat(size)]
+        windowed = self.reshape(x, split)
+        return self.transpose(windowed, [i for i in range(rank + 1) if i != dim + 1] + [dim + 1])
 
     def transpose(self, x, permutation):
         """

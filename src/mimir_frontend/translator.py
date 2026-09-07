@@ -91,7 +91,17 @@ class FXGraphTranslator:
         m["aten.cat.default"] = self._wrap_cat()
         m[torch.permute] = self._wrap_transpose()
         m["aten.permute.default"] = self._wrap_transpose()
+        m["permute"] = self._wrap_permute_method()
         m["t"] = self._wrap_t()
+        m[torch.transpose] = self._wrap_swap_axes()
+        m["aten.transpose.int"] = self._wrap_swap_axes()
+        m["transpose"] = self._wrap_swap_axes()
+        m["unfold"] = self._wrap_unfold()
+        m["aten.unfold.default"] = self._wrap_unfold()
+        m["to"] = self._wrap_to()
+        m["copy_"] = self._wrap_copy_()
+        m["aten.copy.default"] = self._wrap_copy_()
+        m["aten.copy_.default"] = self._wrap_copy_()
         
         m[torch.reshape] = self._wrap_reshape()
         m["aten.reshape.default"] = self._wrap_reshape()
@@ -465,6 +475,58 @@ class FXGraphTranslator:
         def convert(node: fx.Node):
             args = self.retrieve_args(node)
             return self.ops.transpose(args[0], [1, 0])
+        return convert
+
+    def _wrap_permute_method(self):
+        """`x.permute(0, 2, 1)` and `x.permute([0, 2, 1])` both reach here."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            rest = args[1:]
+            permutation = list(rest[0]) if len(rest) == 1 and isinstance(rest[0], (list, tuple)) else list(rest)
+            return self.ops.transpose(args[0], permutation)
+        return convert
+
+    def _wrap_swap_axes(self):
+        """`transpose(dim0, dim1)` swaps two axes, unlike `permute`, which takes the whole permutation."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            x = args[0]
+            rank = len(self.ops.shape_of(x))
+            dim0, dim1 = (int(d) % rank for d in args[1:3])
+            permutation = list(range(rank))
+            permutation[dim0], permutation[dim1] = permutation[dim1], permutation[dim0]
+            return self.ops.transpose(x, permutation)
+        return convert
+
+    def _wrap_unfold(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            dim = args[1] if len(args) > 1 else kw["dimension"]
+            size = args[2] if len(args) > 2 else kw["size"]
+            step = args[3] if len(args) > 3 else kw["step"]
+            return self.ops.unfold(args[0], int(dim), int(size), int(step))
+        return convert
+
+    def _wrap_to(self):
+        """`Tensor.to`: a device move is nothing here, a dtype change goes through the cast."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            targets = [a for a in list(args[1:]) + list(node.kwargs.values()) if isinstance(a, torch.dtype)]
+            if not targets:
+                return args[0]
+            return self.ops.convert_element_type(args[0], targets[0])
+        return convert
+
+    def _wrap_copy_(self):
+        """`dst.copy_(src)` reads back as `src`; the graph is functional, so the write is the value."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            dst, src = args[0], args[1]
+            dst_dims, src_dims = self.ops.shape_of(dst), self.ops.shape_of(src)
+            if not self.ops.rules.same_shape(dst_dims, src_dims):
+                raise NotImplementedError("copy_ with a broadcasting source is not implemented")
+            return src
         return convert
 
     def _wrap_transpose(self):
