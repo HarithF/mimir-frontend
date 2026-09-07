@@ -3,6 +3,7 @@ from torch import fx
 import mim
 from .fastmath import Mode
 from .operators import OperatorLibrary
+from .shape_rules import lit_nat_value
 from mim._plugins.compile import compile as mim_compile
 import operator
 from collections.abc import Callable
@@ -566,7 +567,7 @@ class FXGraphTranslator:
                 dim = args[1]
                 if isinstance(dim, int):
                     return dims[dim]
-                return dims[dim.get_nat()] if hasattr(dim, "get_nat") else dims[dim]
+                return dims[lit_nat_value(dim)]
             return dims
         return convert
 

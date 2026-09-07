@@ -1,6 +1,8 @@
 from typing import List
 import pytest
 import mim
+
+from mimir_frontend.shape_rules import lit_nat_value
 import operator
 import torch
 from torch import fx
@@ -98,7 +100,7 @@ def tensor_shape(tensor_def: mim.Def):
 def tensor_shape_values(tensor_def: mim.Def):
     values = []
     for dim in tensor_shape(tensor_def):
-        values.append(dim.get_nat() if isinstance(dim, mim.Lit) else None)
+        values.append(lit_nat_value(dim))
     return values
 
 
