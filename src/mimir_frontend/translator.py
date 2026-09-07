@@ -54,6 +54,17 @@ class FXGraphTranslator:
             for name in names:
                 m[name] = wrapper
 
+        # Dynamo's graph is functional, so an in-place operator is just its computation.
+        for op, name, func in (
+            (operator.iadd, "aten.add_.Tensor", self.ops.add),
+            (operator.isub, "aten.sub_.Tensor", self.ops.sub),
+            (operator.imul, "aten.mul_.Tensor", self.ops.mul),
+            (operator.itruediv, "aten.div_.Tensor", self.ops.div),
+        ):
+            wrapper = self._wrap_binary(func)
+            m[op] = wrapper
+            m[name] = wrapper
+
         m[torch.clamp] = self._wrap_clamp()
         m["aten.clamp.default"] = self._wrap_clamp()
         m["aten.clamp.Tensor"] = self._wrap_clamp()
@@ -178,7 +189,15 @@ class FXGraphTranslator:
         m["aten.linear.default"] = self._wrap_linear()
         m["torch._C._nn.linear"] = self._wrap_linear()
 
+        m[torch.stack] = self._wrap_stack()
+        m["aten.stack.default"] = self._wrap_stack()
+        m["stack"] = self._wrap_stack()
+
         # Normalization
+        m[torch.nn.functional.layer_norm] = self._wrap_layer_norm()
+        m["layer_norm"] = self._wrap_layer_norm()
+        m["aten.layer_norm.default"] = self._wrap_layer_norm()
+        m["aten.native_layer_norm.default"] = self._wrap_native_layer_norm()
         m[torch.nn.functional.batch_norm] = self._wrap_functional_batch_norm()
         m["batch_norm"] = self._wrap_functional_batch_norm()
         m[torch.batch_norm] = self._wrap_aten_batch_norm()
@@ -250,6 +269,45 @@ class FXGraphTranslator:
             weight = args[1]
             bias = args[2] if len(args) > 2 else node.kwargs.get("bias", None)
             return self.ops.linear(input, weight, bias=bias)
+        return convert
+
+    def _wrap_stack(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            dim = args[1] if len(args) > 1 else node.kwargs.get("dim", 0)
+            return self.ops.stack(args[0], dim=int(dim))
+        return convert
+
+    def _wrap_layer_norm(self):
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+
+            def pick(index, name, default=None):
+                return args[index] if len(args) > index else kw.get(name, default)
+
+            return self.ops.layer_norm(
+                args[0],
+                pick(1, "normalized_shape"),
+                weight=pick(2, "weight"),
+                bias=pick(3, "bias"),
+                eps=pick(4, "eps", 1e-5),
+            )
+        return convert
+
+    def _wrap_native_layer_norm(self):
+        """`aten.native_layer_norm` yields `(out, mean, rstd)`; only the output is materialized."""
+        def convert(node: fx.Node):
+            args = self.retrieve_args(node)
+            kw = node.kwargs
+            out = self.ops.layer_norm(
+                args[0],
+                args[1] if len(args) > 1 else kw["normalized_shape"],
+                weight=args[2] if len(args) > 2 else kw.get("weight"),
+                bias=args[3] if len(args) > 3 else kw.get("bias"),
+                eps=args[4] if len(args) > 4 else kw.get("eps", 1e-5),
+            )
+            return self.world.tuple([out, out, out])
         return convert
 
     def _wrap_functional_batch_norm(self):

@@ -820,6 +820,67 @@ class OperatorLibrary:
             result = self.add(result, self.reshape(bias, per_channel))
         return self._remember_shape(result, dims)
 
+    def layer_norm(self, input, normalized_shape, weight=None, bias=None, eps=1e-5):
+        """`(x - mean) * rsqrt(var + eps) * weight + bias` over the trailing `normalized_shape` axes.
+
+        The variance is the biased one, as torch uses for a norm rather than for `torch.var`."""
+        dims = self.shape_of(input)
+        kept = len(dims) - len(normalized_shape)
+        if not normalized_shape or kept < 0:
+            raise NotImplementedError("layer_norm needs normalized_shape to be a suffix of the input shape")
+
+        # `sum` and an explicit divisor rather than `mean` or `var_mean`: those accumulate into an array
+        # element type, which does not bufferize. Reductions drop keepdim, because a trailing size-1 axis
+        # collapses out of the type and leaves %tensor.broadcast a rank-deficient operand - hence the
+        # explicit broadcast back over the reduced axes.
+        axes = list(range(kept, len(dims)))
+        count = 1
+        for axis in axes:
+            extent = lit_nat_value(dims[axis])
+            if extent is None:
+                raise NotImplementedError("layer_norm needs literal extents over the normalized axes")
+            count *= extent
+
+        def average(x):
+            return self.div(self.sum(x, dim=axes), float(count))
+
+        centered = self.sub(input, self._broadcast_over_suffix(average(input), dims))
+        variance = average(self.mul(centered, centered))
+        result = self.mul(centered, self._broadcast_over_suffix(self.rsqrt(self.add(variance, float(eps))), dims))
+
+        trailing = [self.world.lit_nat(1)] * kept + list(dims[kept:])
+        if weight is not None:
+            result = self.mul(result, self.reshape(weight, trailing))
+        if bias is not None:
+            result = self.add(result, self.reshape(bias, trailing))
+        return self._remember_shape(result, dims)
+
+    def _broadcast_over_suffix(self, x, out_dims):
+        """Broadcasts @p x, whose shape is a prefix of @p out_dims, over the trailing axes."""
+        in_dims = self.shape_of(x)
+        if self.rules.same_shape(in_dims, out_dims):
+            return x
+
+        in_rank, in_shape = self._rank_and_shape(x)
+        out_rank = self.world.lit_nat(len(out_dims))
+        out_shape, _ = self._extract_shape(out_dims)
+
+        callee = self.world.annex(tensor.broadcast_in_dim.value)
+        callee = self._apply_grouped(callee, [self._tensor_element_type(x), in_rank, out_rank])
+        idx_t = self.world.type_idx(out_rank)
+        mapping = self.world.tuple([self.world.lit(idx_t, i) for i in range(len(in_dims))])
+        result = self.world.app(callee, self.world.tuple([in_shape, out_shape, x, mapping]))
+        return self._remember_shape(result, out_dims)
+
+    def stack(self, tensors, dim=0):
+        """`torch.stack`: make room on @p dim in every input, then concatenate along it."""
+        tensors = list(tensors)
+        if not tensors:
+            raise NotImplementedError("torch.stack needs at least one input")
+        if dim < 0:
+            dim += len(self.shape_of(tensors[0])) + 1
+        return self.cat(self.world.tuple([self.unsqueeze(t, dim) for t in tensors]), dim=dim)
+
     def _is_one_group(self, groups):
         if isinstance(groups, int): return groups == 1
         return self._is_lit_nat_value(groups, 1)

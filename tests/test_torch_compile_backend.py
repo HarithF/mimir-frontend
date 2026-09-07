@@ -387,3 +387,55 @@ def test_unfold_matches_eager():
 
 def test_to_dtype_matches_eager():
     check_against_eager(ToDtype(), torch.randn(2, 4))
+
+
+class LayerNormNet(torch.nn.Module):
+    def __init__(self, normalized_shape, affine):
+        super().__init__()
+        self.ln = torch.nn.LayerNorm(normalized_shape, elementwise_affine=affine)
+
+    def forward(self, x):
+        return self.ln(x)
+
+
+class StackNet(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x, y):
+        return torch.stack([x, y, x + y], dim=self.dim)
+
+
+class InPlaceResidual(torch.nn.Module):
+    """The `out += identity` shape of a residual block."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(4, 4, 3, padding=1)
+
+    def forward(self, x):
+        out = self.conv(x)
+        out += x
+        out *= 0.5
+        return torch.relu(out)
+
+
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("normalized_shape,shape", [((8,), (2, 3, 8)), ((3, 8), (2, 3, 8))])
+def test_layer_norm_matches_eager(normalized_shape, shape, affine):
+    model = LayerNormNet(normalized_shape, affine).eval()
+    if affine:
+        with torch.no_grad():
+            model.ln.weight.normal_()
+            model.ln.bias.normal_()
+    check_against_eager(model, torch.randn(*shape))
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_stack_matches_eager(dim):
+    check_against_eager(StackNet(dim), torch.randn(2, 4), torch.randn(2, 4))
+
+
+def test_inplace_residual_matches_eager():
+    check_against_eager(InPlaceResidual(), torch.randn(2, 4, 6, 6))
