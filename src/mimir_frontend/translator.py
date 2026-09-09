@@ -670,7 +670,11 @@ class FXGraphTranslator:
             args = self.retrieve_args(node)
             obj = args[0]
             index = args[1]
-            
+
+            # A multi-output op (`split`) hands back a Python list, so projecting is free.
+            if isinstance(obj, (list, tuple)):
+                return obj[index]
+
             # Check if obj is a tensor by inspecting its type
             ty = obj.type()
             

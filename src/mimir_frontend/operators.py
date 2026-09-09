@@ -1511,7 +1511,11 @@ class OperatorLibrary:
 
     def split(self, x, split_size_or_sections, dim=0):
         """
-        Translates to multiple `slice` operations.
+        Translates to multiple `slice` operations, returned as a Python list.
+
+        Not a `world.tuple`: equally-shaped parts fold its type into an `Arr`, which is
+        indistinguishable from one tensor of one higher rank, so `getitem` would slice the
+        pack instead of projecting it -- materializing the parts back into a single buffer.
         """
         in_dims = self.shape_of(x)
         rank_val = len(in_dims)
@@ -1539,7 +1543,7 @@ class OperatorLibrary:
                 slices.append(part)
                 curr = end
         
-        return self.world.tuple(slices)
+        return slices
         
     def select(self, x, dim, index):
         """
