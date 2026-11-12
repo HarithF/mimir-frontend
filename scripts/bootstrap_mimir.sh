@@ -11,10 +11,11 @@ git -C "${ROOT_DIR}" submodule update --init --recursive
 fetch_plugin() {
   local dir="${MIMIR_DIR}/extra/$1"
   [[ -d "${dir}/.git" ]] || git clone "$2" "${dir}"
-  git -C "${dir}" fetch -q origin "$3"
+  # Fetch from the URL, not `origin`, so a checkout cloned from another fork still switches.
+  git -C "${dir}" fetch -q "$2" "$3"
   git -C "${dir}" checkout -q --detach FETCH_HEAD
 }
-fetch_plugin torch https://github.com/hsqStephenZhang/mimir-torch-plugin.git "${MIMIR_TORCH_PLUGIN_REF:-nominal}"
+fetch_plugin torch "${MIMIR_TORCH_PLUGIN_URL:-https://github.com/HarithF/mimir-torch-plugin.git}" "${MIMIR_TORCH_PLUGIN_REF:-art-eval}"
 fetch_plugin runtime https://github.com/hsqStephenZhang/mimir-runtime-plugin.git "${MIMIR_RUNTIME_PLUGIN_REF:-feat/ll-emit}"
 
 # Optional MLIR emitter (`emit_only="mlir"` backend option); MIM_MLIR_SKIP=1 builds without it.

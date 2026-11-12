@@ -17,8 +17,15 @@ Then build the local MimIR Python binding and sync the Python environment:
 ./scripts/bootstrap_mimir.sh
 ```
 
-The script initializes recursive submodules, creates a Python 3.14 `uv` venv,
-builds MimIR's `mim_py` target, and runs `uv sync`.
+The script initializes recursive submodules, clones the MimIR plugins the
+frontend needs into `MimIR/extra/`, creates a Python 3.14 `uv` venv, builds
+MimIR's `mim_py` target, and runs `uv sync`. The plugins are the torch dialect
+from [`HarithF/mimir-torch-plugin`](https://github.com/HarithF/mimir-torch-plugin)
+(branch `art-eval`, which lowers grouped convolutions to `tensor.conv_grouped`)
+and the runtime checks from
+[`hsqStephenZhang/mimir-runtime-plugin`](https://github.com/hsqStephenZhang/mimir-runtime-plugin)
+(branch `feat/ll-emit`); `MIMIR_TORCH_PLUGIN_URL`, `MIMIR_TORCH_PLUGIN_REF` and
+`MIMIR_RUNTIME_PLUGIN_REF` override them.
 
 MimIR needs a C++23 toolchain (`<print>` must compile). On macOS use Homebrew
 LLVM rather than Apple clang, whose Command Line Tools can ship incomplete
