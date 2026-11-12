@@ -18,8 +18,8 @@ the build/test mechanics and the architecture.
   `mim_py` and resyncs the `mim` wheel, which lives at `MimIR/build/mim_py_stage/main`). The JIT cache is
   keyed on a fingerprint of the MimIR install, so a rebuild invalidates it automatically.
 - The binding generator needs `clang.cindex`, so `libclang` is a dev dependency (`uv sync` installs it).
-- Plugin revisions are pinned in the bootstrap script (`MIMIR_TORCH_PLUGIN_REF`, default `nominal`;
-  `MIMIR_RUNTIME_PLUGIN_REF`, default `feat/ll-emit`). `operators.py` looks annexes up by name
+- Plugin revisions are pinned in the bootstrap script (`MIMIR_TORCH_PLUGIN_URL`/`MIMIR_TORCH_PLUGIN_REF`,
+  default `HarithF/mimir-torch-plugin` branch `art-eval`; `MIMIR_RUNTIME_PLUGIN_REF`, default `feat/ll-emit`). `operators.py` looks annexes up by name
   (`mim._plugins.torch`), so the frontend and the pinned `torch.mim` must agree on the axiom set.
 
 ## Running things
