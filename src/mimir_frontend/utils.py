@@ -241,7 +241,11 @@ def _default_compile_phase(world: mim.World) -> mim.Def:
             optimize,
             _named_phase(world, "option.lower_option"),
             world.annex(mim_compile.cleanup.value),
+            # Same tensor stage as MimIR's default pipeline: reassociate matmul
+            # chains, then fuse adjacent maps so they share one loop and buffer.
+            _named_phase(world, "tensor.reassoc"),
             _named_phase(world, "tensor.lower_tensor"),
+            _named_phase(world, "tensor.fuse_tensor"),
             _named_phase(world, "tensor.lower_to_mem"),
             _cond_phase(world, "tensor", _named_phase(world, "mem.add_mem")),
             _named_phase(world, "btensor.lower_map_reduce"),
@@ -278,6 +282,31 @@ def _define_compile_lam(world: mim.World, phase: mim.Def) -> mim.Def:
 def install_execution_compile_phase(world: mim.World) -> mim.Def:
     """Install the Torch-aware host execution pipeline as ``_compile``."""
     return _define_compile_lam(world, _default_compile_phase(world))
+
+
+def _mlir_compile_phase(world: mim.World) -> mim.Def:
+    """Tensor-level pipeline for the out-of-tree `mlir` plugin.
+
+    The emitter consumes `%tensor.map_reduce_post` and friends, so this stops
+    right after lowering the Torch dialect to tensor operations: no
+    partial-evaluation fixpoint, fusion, bufferization, or CPS conversion.
+    """
+    return _compile_phases(
+        world,
+        False,
+        [
+            _named_phase(world, "regex.lower_regex"),
+            _named_phase(world, "torch.lower_torch"),
+            _named_phase(world, "option.lower_option"),
+            _named_phase(world, "tensor.lower_tensor"),
+            _named_phase(world, "mlir.emit"),
+        ],
+    )
+
+
+def install_mlir_compile_phase(world: mim.World) -> mim.Def:
+    """Install the tensor-level MLIR emission pipeline as ``_compile``."""
+    return _define_compile_lam(world, _mlir_compile_phase(world))
 
 
 def build_model_function(

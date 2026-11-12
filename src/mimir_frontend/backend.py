@@ -54,6 +54,12 @@ and clang), so rebuilding MimIR invalidates stale entries. Parameter *values*
 are runtime arguments and deliberately not part of the key. A `debug_dir`
 request always recompiles (to produce the dumps) but still refreshes the cache.
 
+MLIR: ``options={"emit_only": "mlir"}`` (or ``MIMIR_EMIT_ONLY=mlir``) runs the
+`mlir` plugin's pipeline (MimIR/extra/mim_mlir) instead of the LLVM one and
+stops at `<name>.mlir` in the ``debug_dir`` (required, since the build
+directory is otherwise temporary): nothing is JIT-compiled, the cache is
+bypassed, and the returned callable runs the graph eagerly.
+
 Current limitations: float32 outputs, float32/int64 inputs, static shapes, and
 inference only (the compiled function does not participate in autograd).
 
@@ -87,7 +93,11 @@ import torch
 from torch import fx
 
 from .decomposition import apply_decomposition_policy, resolve_decomposition_policy
-from .utils import build_model_function, install_execution_compile_phase
+from .utils import (
+    build_model_function,
+    install_execution_compile_phase,
+    install_mlir_compile_phase,
+)
 
 # Dynamo intentionally keeps recurrent modules opaque unless this is enabled.
 # The backend handles their standard ATen entry points directly.
@@ -98,6 +108,13 @@ torch._dynamo.config.allow_rnn = True
 # contain local CFG only; loading `clos` would unnecessarily closure-convert
 # every loop continuation and transitively capture all later model parameters.
 EXEC_PLUGINS = ["opt", "math", "tensor", "torch", "ll"]
+
+# The MLIR pipeline (see `install_mlir_compile_phase`) stops at tensor-level IR
+# and hands it to the out-of-tree `mlir` plugin's `%mlir.emit`. It runs on its
+# own Driver/World so the two backends never share partially lowered state.
+MLIR_EXEC_PLUGINS = ["math", "tensor", "torch", "mlir"]
+
+EMIT_ONLY = ("mlir",)
 
 def _load_crt() -> ctypes.CDLL:
     """The C runtime providing the `free` that matches the JIT'd code's `malloc`."""
@@ -313,6 +330,9 @@ def _artifact_names(build_dir: Path, name: str) -> list[str]:
         f"{name}_failed.mim",
         f"{name}.ll",
         f"{name}{_shared_lib_suffix()}",
+        f"{name}_mlir_pre.mim",
+        f"{name}_mlir_failed.mim",
+        f"{name}.mlir",
         f"{name}_profile.txt",
         f"{name}_profile.json",
     )
@@ -439,6 +459,57 @@ def _compile_world(driver, world, build_dir: Path, name: str, debug_dir, profile
     return lib, built_lib
 
 
+def _eager_callable(gm, restore, out_offsets, out_numels, out_shapes):
+    """Run the (output-packed) graph eagerly and unpack it like the native ABI."""
+
+    def eager(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        flat = gm(*args).reshape(-1)
+        return restore(
+            flat[offset : offset + numel].reshape(shape)
+            for offset, numel, shape in zip(out_offsets, out_numels, out_shapes)
+        )
+
+    return eager
+
+
+def _emit_mlir(
+    gm: fx.GraphModule,
+    input_shapes,
+    input_dtypes,
+    name: str,
+    build_dir: Path,
+    max_fp_iters: int | None,
+) -> Path:
+    """Run the MLIR pipeline on a fresh Driver and write `<name>.mlir`."""
+    driver = mim.Driver()
+    driver.load_plugins(MLIR_EXEC_PLUGINS)
+    if max_fp_iters is not None:
+        driver.flags().max_fp_iters = max_fp_iters
+    world = driver.world()
+    build_model_function(world, gm, input_shapes, input_dtypes=input_dtypes, name=name)
+    install_mlir_compile_phase(world)
+    with _compile_lock:
+        old_cwd = os.getcwd()
+        os.chdir(build_dir)
+        try:
+            world.set(f"{name}_mlir_pre")
+            world.write()
+            # `%mlir.emit` names its output after the world.
+            world.set(name)
+            try:
+                world.optimize()
+            except Exception:
+                world.set(f"{name}_mlir_failed")
+                world.write()
+                raise
+        finally:
+            os.chdir(old_cwd)
+    out = build_dir / f"{name}.mlir"
+    if not out.exists():
+        raise RuntimeError(f"%mlir.emit did not write {out}")
+    return out
+
+
 def mimir_backend(
     gm: fx.GraphModule,
     example_inputs: list[torch.Tensor],
@@ -458,10 +529,15 @@ def mimir_backend(
     )
     cache_enabled = opts.pop("cache", True)
     cache_dir = Path(opts.pop("cache_dir", None) or os.environ.get("MIMIR_CACHE_DIR") or _default_cache_dir())
+    emit_only = opts.pop("emit_only", None) or os.environ.get("MIMIR_EMIT_ONLY") or None
     if opts:
         raise TypeError(f"unknown mimir backend options: {sorted(opts)}")
     if profile is not None and profile not in ("summary", "tree", "trace"):
         raise ValueError(f"profile must be 'summary', 'tree', or 'trace', got {profile!r}")
+    if emit_only is not None and emit_only not in EMIT_ONLY:
+        raise ValueError(f"emit_only must be one of {EMIT_ONLY}, got {emit_only!r}")
+    if emit_only and not debug_dir:
+        raise ValueError("emit_only writes its artifacts into debug_dir; pass one")
     if max_fp_iters is not None:
         max_fp_iters = int(max_fp_iters)
         if max_fp_iters <= 0:
@@ -522,7 +598,7 @@ def mimir_backend(
 
     lib = keep_alive = None
     # debug_dir and profile both require an actual compile to observe.
-    if cache_enabled and not debug_dir and not profile and cached_so.exists():
+    if cache_enabled and not debug_dir and not profile and not emit_only and cached_so.exists():
         lib = _load_cached_library(cached_so)
         _last_compile_timings = None
 
@@ -534,7 +610,9 @@ def mimir_backend(
             build_dir = Path(debug_dir).resolve()
             build_dir.mkdir(parents=True, exist_ok=True)
             print(f"[mimir] {name}: keeping compilation artifacts in {build_dir}", file=sys.stderr)
-            manifest_path = build_dir / f"{name}_manifest.json"
+            manifest_path = build_dir / (
+                f"{name}_mlir_manifest.json" if emit_only == "mlir" else f"{name}_manifest.json"
+            )
             manifest = {
                 "schema_version": 1,
                 "name": name,
@@ -543,8 +621,9 @@ def mimir_backend(
                 "status": "prepared",
                 "inputs": _tensor_manifest(input_shapes, input_dtypes),
                 "outputs": _tensor_manifest(out_shapes, out_dtypes),
-                "plugins": EXEC_PLUGINS,
+                "plugins": MLIR_EXEC_PLUGINS if emit_only == "mlir" else EXEC_PLUGINS,
                 "options": {
+                    "emit_only": emit_only,
                     "cache": cache_enabled,
                     "max_fp_iters": max_fp_iters,
                     "profile": profile,
@@ -561,6 +640,22 @@ def mimir_backend(
 
         completed = False
         try:
+            if emit_only == "mlir":
+                _timed(
+                    timings,
+                    "mlir",
+                    lambda: _emit_mlir(gm, input_shapes, input_dtypes, name, build_dir, max_fp_iters),
+                )
+                timings["total"] = time.perf_counter() - backend_started
+                _last_compile_timings = timings
+                completed = True
+                if manifest_path is not None:
+                    manifest["status"] = "succeeded"
+                    manifest["artifacts"] = _artifact_names(build_dir, name)
+                    manifest["timings"] = timings
+                    _write_debug_manifest(manifest_path, manifest)
+                return _eager_callable(gm, restore, out_offsets, out_numels, out_shapes)
+
             driver = mim.Driver()
             driver.load_plugins(EXEC_PLUGINS)
             if max_fp_iters is not None:
