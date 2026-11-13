@@ -146,6 +146,17 @@ def last_compile_timings() -> dict[str, float] | None:
     return dict(_last_compile_timings) if _last_compile_timings is not None else None
 
 
+_last_backend_entry: float | None = None
+
+
+def last_backend_entry() -> float | None:
+    """time.perf_counter() when the backend last received a graph from Dynamo.
+
+    The time from calling a compiled model until this mark is Dynamo's tracing.
+    """
+    return _last_backend_entry
+
+
 def _timed(timings: dict[str, float], stage: str, function):
     started = time.perf_counter()
     try:
@@ -517,8 +528,9 @@ def mimir_backend(
     options: dict | None = None,
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
     """Compile a Dynamo FX graph to native code through MimIR."""
-    global _last_compile_timings
+    global _last_compile_timings, _last_backend_entry
     backend_started = time.perf_counter()
+    _last_backend_entry = backend_started
     timings: dict[str, float] = {}
     opts = dict(options or {})
     debug_dir = opts.pop("debug_dir", None) or os.environ.get("MIMIR_DEBUG_DIR")
