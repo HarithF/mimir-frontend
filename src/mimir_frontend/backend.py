@@ -79,6 +79,7 @@ import math
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -94,6 +95,7 @@ from torch import fx
 
 from .decomposition import apply_decomposition_policy, resolve_decomposition_policy
 from .utils import (
+    TARGETS,
     build_model_function,
     install_execution_compile_phase,
     install_mlir_compile_phase,
@@ -115,6 +117,34 @@ EXEC_PLUGINS = ["opt", "math", "tensor", "torch", "ll"]
 MLIR_EXEC_PLUGINS = ["math", "tensor", "torch", "mlir"]
 
 EMIT_ONLY = ("mlir",)
+
+# `target="nvptx"` offloads every tensor map_reduce to an NVIDIA GPU: `gpu` adds
+# %gpu.lower_btensor_map_reduce, `nvptx` emits the host LLVM IR with the device
+# fatbin embedded (it needs llc with NVPTX, ptxas and fatbinary on PATH).
+GPU_EXEC_PLUGINS = EXEC_PLUGINS + ["gpu", "nvptx"]
+
+
+def _cuda_link_args() -> list[str]:
+    """Link against libcuda; the toolkit's stub suffices when no driver is installed."""
+    args = []
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or "/opt/cuda"
+    for stubs in (Path(cuda_home) / "lib64" / "stubs", Path(cuda_home) / "lib" / "stubs"):
+        if (stubs / "libcuda.so").exists():
+            args.append(f"-L{stubs}")
+            break
+    return args + ["-lcuda"]
+
+
+class _CudaJIT(mim.JIT):
+    """mim.JIT plus libcuda, which the nvptx host code calls."""
+
+    def _compile_so(self):
+        so_path = self._get_so_path()
+        cmd = ["clang", "-O3", "-march=native", self.ll_name, "-o", so_path, "-shared", "-Wno-override-module"]
+        # nvptx.emit declares its kernel table `dso_local`, which a shared object only accepts when bound locally.
+        cmd.append("-Wl,-Bsymbolic")
+        subprocess.run(cmd + _cuda_link_args(), check=True)
+        return so_path
 
 def _load_crt() -> ctypes.CDLL:
     """The C runtime providing the `free` that matches the JIT'd code's `malloc`."""
@@ -438,7 +468,7 @@ def _output_tensors_from_metadata(container) -> list[torch.Tensor]:
     return outputs
 
 
-def _compile_world(driver, world, build_dir: Path, name: str, debug_dir, profile, timings):
+def _compile_world(driver, world, build_dir: Path, name: str, debug_dir, profile, timings, jit_cls=mim.JIT):
     """Optimize, emit, and load one graph while cwd points at its build dir."""
     try:
         with _compile_lock:
@@ -459,7 +489,7 @@ def _compile_world(driver, world, build_dir: Path, name: str, debug_dir, profile
                 if debug_dir:
                     world.set(f"{name}_post")
                     world.write()
-                jit = mim.JIT(name, [name])
+                jit = jit_cls(name, [name])
                 lib = _timed(timings, "jit", jit.compile_and_load)
                 built_lib = Path(jit._get_so_path()).resolve()
             finally:
@@ -542,6 +572,14 @@ def mimir_backend(
     cache_enabled = opts.pop("cache", True)
     cache_dir = Path(opts.pop("cache_dir", None) or os.environ.get("MIMIR_CACHE_DIR") or _default_cache_dir())
     emit_only = opts.pop("emit_only", None) or os.environ.get("MIMIR_EMIT_ONLY") or None
+    target = opts.pop("target", None) or os.environ.get("MIMIR_TARGET") or "cpu"
+    # Compute capability for the device binary, e.g. "86"; nvptx asks nvidia-smi when unset.
+    gpu_sm = opts.pop("gpu_sm", None) or os.environ.get("MIMIR_GPU_SM") or None
+    if target not in TARGETS:
+        raise ValueError(f"target must be one of {TARGETS}, got {target!r}")
+    if target != "cpu" and emit_only:
+        raise ValueError("emit_only applies to the cpu target only")
+    exec_plugins = GPU_EXEC_PLUGINS if target == "nvptx" else EXEC_PLUGINS
     if opts:
         raise TypeError(f"unknown mimir backend options: {sorted(opts)}")
     if profile is not None and profile not in ("summary", "tree", "trace"):
@@ -605,7 +643,8 @@ def mimir_backend(
 
     # The key covers the packed graph, input shapes, and the MimIR install;
     # it also names the exported symbol, so cached libraries are self-contained.
-    name = f"mimir_graph_{_cache_key(gm, list(zip(input_shapes, input_dtypes)))}"
+    key_extra = [] if target == "cpu" else [(target, gpu_sm)]
+    name = f"mimir_graph_{_cache_key(gm, list(zip(input_shapes, input_dtypes)) + key_extra)}"
     cached_so = cache_dir / f"{name}{_shared_lib_suffix()}"
 
     lib = keep_alive = None
@@ -633,9 +672,11 @@ def mimir_backend(
                 "status": "prepared",
                 "inputs": _tensor_manifest(input_shapes, input_dtypes),
                 "outputs": _tensor_manifest(out_shapes, out_dtypes),
-                "plugins": MLIR_EXEC_PLUGINS if emit_only == "mlir" else EXEC_PLUGINS,
+                "plugins": MLIR_EXEC_PLUGINS if emit_only == "mlir" else exec_plugins,
                 "options": {
                     "emit_only": emit_only,
+                    "target": target,
+                    "gpu_sm": gpu_sm,
                     "cache": cache_enabled,
                     "max_fp_iters": max_fp_iters,
                     "profile": profile,
@@ -669,7 +710,9 @@ def mimir_backend(
                 return _eager_callable(gm, restore, out_offsets, out_numels, out_shapes)
 
             driver = mim.Driver()
-            driver.load_plugins(EXEC_PLUGINS)
+            driver.load_plugins(exec_plugins)
+            if gpu_sm is not None:
+                driver.add_arg("nvptx", f"sm={gpu_sm}")
             if max_fp_iters is not None:
                 driver.flags().max_fp_iters = max_fp_iters
             world = driver.world()
@@ -685,11 +728,12 @@ def mimir_backend(
                 build_model_function(
                     world, gm, input_shapes, input_dtypes=input_dtypes, name=name
                 )
-                install_execution_compile_phase(world)
+                install_execution_compile_phase(world, target)
 
             _timed(timings, "translate", translate)
             lib, built_lib = _compile_world(
-                driver, world, build_dir, name, debug_dir, profile, timings
+                driver, world, build_dir, name, debug_dir, profile, timings,
+                jit_cls=_CudaJIT if target == "nvptx" else mim.JIT,
             )
             timings["total"] = time.perf_counter() - backend_started
             _last_compile_timings = timings

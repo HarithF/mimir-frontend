@@ -187,7 +187,13 @@ def _cond_phase(world: mim.World, plugin_name: str, phase: mim.Def) -> mim.Def:
     return world.call(mim_compile.cond, _mimir_i8_string(world, plugin_name), phase)
 
 
-def _default_compile_phase(world: mim.World) -> mim.Def:
+TARGETS = ("cpu", "nvptx")
+
+
+def _default_compile_phase(world: mim.World, target: str = "cpu") -> mim.Def:
+    if target not in TARGETS:
+        raise ValueError(f"target must be one of {TARGETS}, got {target!r}")
+    gpu = target == "nvptx"
     optimize = _compile_phases(
         world,
         False,
@@ -248,6 +254,8 @@ def _default_compile_phase(world: mim.World) -> mim.Def:
             _named_phase(world, "tensor.fuse_tensor"),
             _named_phase(world, "tensor.lower_to_mem"),
             _cond_phase(world, "tensor", _named_phase(world, "mem.add_mem")),
+            # Offloads every map_reduce as a kernel; the CPU lowering then only sees what is left.
+            *([_named_phase(world, "gpu.lower_btensor_map_reduce")] if gpu else []),
             _named_phase(world, "btensor.lower_map_reduce"),
             _named_phase(world, "gpu.mem_checks"),
             _named_phase(world, "autodiff.eval"),
@@ -265,7 +273,8 @@ def _default_compile_phase(world: mim.World) -> mim.Def:
             _named_phase(world, "mem.alloc2malloc_repl"),
             _named_phase(world, "refly.remove_dbg_repl"),
             _named_phase(world, "gpu.check_addr_spaces_repl"),
-            _named_phase(world, "runtime.ll_emit"),
+            # nvptx.emit writes <world>.ll (host, device fatbin embedded) and <world>_dev.ll.
+            _named_phase(world, "nvptx.emit" if gpu else "runtime.ll_emit"),
         ],
     )
 
@@ -279,9 +288,9 @@ def _define_compile_lam(world: mim.World, phase: mim.Def) -> mim.Def:
     return compile_lam
 
 
-def install_execution_compile_phase(world: mim.World) -> mim.Def:
-    """Install the Torch-aware host execution pipeline as ``_compile``."""
-    return _define_compile_lam(world, _default_compile_phase(world))
+def install_execution_compile_phase(world: mim.World, target: str = "cpu") -> mim.Def:
+    """Install the Torch-aware execution pipeline for `target` as ``_compile``."""
+    return _define_compile_lam(world, _default_compile_phase(world, target))
 
 
 def _mlir_compile_phase(world: mim.World) -> mim.Def:
