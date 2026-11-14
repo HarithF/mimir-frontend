@@ -368,3 +368,12 @@ def test_memory_limit_ignores_unsupported_macos_rlimit(monkeypatch):
     )
 
     runner.apply_memory_limit(4)
+
+
+def test_dynamo_trace_is_time_until_the_backend_was_entered(monkeypatch):
+    monkeypatch.setattr(runner, "last_backend_entry", lambda: 12.5)
+    assert runner.dynamo_trace_since(10.0) == 2.5
+    monkeypatch.setattr(runner, "last_backend_entry", lambda: None)
+    assert runner.dynamo_trace_since(10.0) is None
+    monkeypatch.setattr(runner, "last_backend_entry", lambda: 9.0)  # stale: before the call
+    assert runner.dynamo_trace_since(10.0) is None

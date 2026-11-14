@@ -22,7 +22,7 @@ from typing import Any
 import torch
 import yaml
 
-from mimir_frontend.backend import last_compile_timings, mimir_backend
+from mimir_frontend.backend import last_backend_entry, last_compile_timings, mimir_backend
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -348,13 +348,33 @@ def prepare_case(
 
 @dataclass
 class MlirEmit:
-    """Per-case `--emit-mlir` settings; `status` and `detail` receive the emission outcome."""
+    """Per-case `--emit-mlir` settings; `status`, `detail` and `trace` receive the outcome."""
 
     out_dir: Path
     mlir_opt: str | None
     only: bool
     status: str = ""
     detail: str = ""
+    trace: float | None = None  # Dynamo's tracing time for the emit, in seconds
+
+
+def dynamo_trace_since(started: float) -> float | None:
+    """Seconds from `started` (calling the compiled model) until the backend got the graph."""
+    entry = last_backend_entry()
+    return entry - started if entry is not None and entry >= started else None
+
+
+_dynamo_warm = False
+
+
+def warm_up_dynamo() -> None:
+    """Pay Dynamo's one-time start-up cost once per process, so it is not part of
+    the first model's tracing time."""
+    global _dynamo_warm
+    if not _dynamo_warm:
+        torch.compile(lambda x: x + 1, backend="eager", fullgraph=True)(torch.ones(1))
+        torch._dynamo.reset()
+        _dynamo_warm = True
 
 
 def verify_mlir(path: Path, mlir_opt: str | None) -> None:
@@ -375,9 +395,12 @@ def emit_mlir(model, inputs, max_fp_iters: int | None, mlir: MlirEmit) -> None:
     if max_fp_iters:
         options["max_fp_iters"] = max_fp_iters
     torch._dynamo.reset()
+    warm_up_dynamo()
     try:
         with torch.no_grad():
+            started = time.perf_counter()
             torch.compile(model, backend=mimir_backend, fullgraph=True, dynamic=False, options=options)(*inputs)
+            mlir.trace = dynamo_trace_since(started)
         emitted = sorted(mlir.out_dir.glob("*.mlir"))
         if not emitted:
             raise RuntimeError("no .mlir emitted")
@@ -407,6 +430,8 @@ def run_case(
     case_fp_iters = case.get("max_fp_iters", max_fp_iters)
     if mlir is not None and mlir.only:
         timed_call(timings, "mlir", lambda: emit_mlir(model, inputs, case_fp_iters, mlir))
+        if mlir.trace is not None:
+            timings["mlir_dynamo_trace"] = mlir.trace
         if mlir.status == "FAIL":
             raise PhaseError("mlir", RuntimeError(mlir.detail))
         return
@@ -421,6 +446,8 @@ def run_case(
             raise InvalidCaseError(f"eager fixture failed: {exc}") from exc
         if mlir is not None:
             timed_call(timings, "mlir", lambda: emit_mlir(model, inputs, case_fp_iters, mlir))
+        if mlir.trace is not None:
+            timings["mlir_dynamo_trace"] = mlir.trace
         try:
             options: dict[str, Any] = {"max_fp_iters": case_fp_iters} if case_fp_iters else {}
             if mlir is not None:
@@ -443,11 +470,16 @@ def run_case(
             )
             # torch.compile is lazy: MimIR lowering and JIT happen here, on the
             # first call, together with that call's execution.
+            warm_up_dynamo()
+            started = time.perf_counter()
             actual = timed_call(
                 timings,
                 "compile_execute",
                 lambda: compiled(*inputs),
             )
+            trace = dynamo_trace_since(started)
+            if trace is not None:
+                timings["dynamo_trace"] = trace
             for stage, seconds in (last_compile_timings() or {}).items():
                 timings[f"backend_{stage}"] = seconds
         except Exception as exc:
