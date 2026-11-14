@@ -446,8 +446,8 @@ def run_case(
             raise InvalidCaseError(f"eager fixture failed: {exc}") from exc
         if mlir is not None:
             timed_call(timings, "mlir", lambda: emit_mlir(model, inputs, case_fp_iters, mlir))
-        if mlir.trace is not None:
-            timings["mlir_dynamo_trace"] = mlir.trace
+            if mlir.trace is not None:
+                timings["mlir_dynamo_trace"] = mlir.trace
         try:
             options: dict[str, Any] = {"max_fp_iters": case_fp_iters} if case_fp_iters else {}
             if mlir is not None:
