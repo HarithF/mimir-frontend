@@ -2,9 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`AGENTS.md` holds the project owner's standing instructions (answer in Chinese, always go through `uv`,
-TDD, no cheating tests, report hard problems instead of working around them). Follow it; this file adds
-the build/test mechanics and the architecture.
+Standing rules: always go through `uv`; test-driven development; never make a test pass by cheating;
+report hard problems instead of working around them.
 
 ## Setup and build
 
@@ -45,7 +44,7 @@ uv run --no-sync python scripts/run_kernelbench_mimir.py --suite level1 --size-d
   `MIMIR_DEBUG_DIR`, `MIMIR_PROFILE` (`summary|tree|trace`), `MIMIR_MAX_FP_ITERS` and
   `MIMIR_DECOMPOSITION_POLICY` (`mimir|none`) mirror the `torch.compile(..., options={...})` keys.
 - KernelBench expectations at size divisor 16: Level 1 100/100, Level 2 99/100 (case 28 is a known
-  lowering defect, see `docs/kernelbench_level2_report.md`). CI (`.github/workflows/kernelbench.yml`)
+  lowering defect). CI (`.github/workflows/kernelbench.yml`)
   enforces pass rates 1.00 / 0.95 / 1.00 for levels 1–3 on Linux and macOS.
 
 ## Architecture
@@ -88,9 +87,6 @@ expansion only reaches ops MimIR accepts.
 
 ## Reference material in the repo
 
-- `docs/kernelbench_level*_report.md`: per-level failure analysis; `docs/frontend_backend_engineering.md`:
-  JIT cache, manifest and benchmark design.
-- `shape_invariants.md` and `dynamic_shape.md`: the shape/symbolic-dimension design rules the translator
-  follows; `operators_summary.md` and `operator_gemini_impl_summary.md`: operator coverage tables.
+- `docs/frontend_backend_engineering.md`: JIT cache, manifest and benchmark design.
 - `MimIR/` is the pinned MimIR submodule (fork branch `frontend-dev`, upstream master plus `tensor.scan` and fixes); `KernelBench/` is the
   benchmark corpus submodule, excluded from pytest collection.

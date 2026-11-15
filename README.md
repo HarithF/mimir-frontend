@@ -184,9 +184,7 @@ uv run --no-sync python scripts/run_kernelbench_mimir.py --suite level1 \
   JSON.
 
 Expected coverage at `--size-divisor 16` is 100/100 on Level 1 and 99/100 on
-Level 2; the remaining Level 2 failure is documented in
-`docs/kernelbench_level2_report.md`. Level 3 and 4 details are in the
-other `docs/kernelbench_level*_report.md` files.
+Level 2 (case 28 is a known lowering defect).
 
 ## Fresh Clone Smoke Test
 
