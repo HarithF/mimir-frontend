@@ -4,4 +4,4 @@
 [submodule "MimIR"]
 	path = MimIR
 	url = https://github.com/HarithF/mimir.git
-branch = frontend-dev
+branch = gpu-device-concat
