@@ -64,3 +64,74 @@ def test_nvptx_target_matches_eager(tmp_path, monkeypatch):
     torch.testing.assert_close(got, model(x), rtol=1e-4, atol=1e-5)
     host = [p for p in (tmp_path / "dbg").rglob("mimir_graph_*.ll") if not p.name.endswith("_dev.ll")]
     assert len(host) == 1 and "@.fatbin = private constant" in host[0].read_text(), "fatbin not embedded"
+
+
+class CatNet(torch.nn.Module):
+    """Two producers, a `cat`, and a consumer: the result of every step can stay on the device."""
+
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Conv2d(3, 4, 3)
+        self.b = torch.nn.Conv2d(3, 6, 3)
+        self.c = torch.nn.Conv2d(10, 5, 1)
+
+    def forward(self, x):
+        return self.c(torch.cat([self.a(x), torch.relu(self.b(x))], dim=1))
+
+
+def _host_ll(debug_dir: Path) -> str:
+    host = [p for p in debug_dir.rglob("mimir_graph_*.ll") if not p.name.endswith("_dev.ll")]
+    assert len(host) == 1, host
+    return host[0].read_text()
+
+
+@pytest.mark.skipif(not _cuda_tools_on_path(), reason="ptxas/fatbinary not found (CUDA toolkit)")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+@pytest.mark.parametrize("dim", [1, -1], ids=["channels", "last"])
+def test_cat_stays_on_the_device(dim, tmp_path, monkeypatch):
+    """`torch.cat` between GPU kernels is a kernel itself: only the model's output is copied back."""
+    monkeypatch.setenv("PATH", f"{CUDA_BIN}{os.pathsep}{os.environ['PATH']}")
+    sm = "".join(map(str, torch.cuda.get_device_capability(0)))
+    torch.manual_seed(0)
+    if dim == 1:
+        model, x = CatNet().eval(), torch.randn(2, 3, 9, 9)
+    else:
+        lin = torch.nn.Linear(6, 5)
+        model = type("M", (torch.nn.Module,), {"forward": lambda self, x: lin(torch.cat([x * 2.0, torch.relu(x)], dim=-1))})()
+        x = torch.randn(4, 3)
+    got = _compile(model, x, tmp_path, target="nvptx", gpu_sm=sm, debug_dir=str(tmp_path / "dbg"))
+    torch.testing.assert_close(got, model(x), rtol=1e-4, atol=1e-5)
+    text = _host_ll(tmp_path / "dbg")
+    assert text.count("call i32 @cuMemcpyDtoH") == 1, "an intermediate result was copied back to the host"
+
+
+PAD_MODELS = {
+    "padded-convs": (
+        lambda: torch.nn.Sequential(
+            torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.ReLU(), torch.nn.Conv2d(4, 5, 3, padding=1)
+        ),
+        (2, 3, 8, 8),
+    ),
+    "pooling": (
+        lambda: torch.nn.Sequential(
+            torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.MaxPool2d(3, stride=2, padding=1), torch.nn.Conv2d(4, 5, 1)
+        ),
+        (1, 3, 9, 9),
+    ),
+}
+
+
+@pytest.mark.skipif(not _cuda_tools_on_path(), reason="ptxas/fatbinary not found (CUDA toolkit)")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+@pytest.mark.parametrize("name", PAD_MODELS)
+def test_padding_stays_on_the_device(name, tmp_path, monkeypatch):
+    """Padding between GPU kernels is a kernel itself: only the model's output is copied back."""
+    monkeypatch.setenv("PATH", f"{CUDA_BIN}{os.pathsep}{os.environ['PATH']}")
+    sm = "".join(map(str, torch.cuda.get_device_capability(0)))
+    torch.manual_seed(0)
+    factory, shape = PAD_MODELS[name]
+    model, x = factory().eval(), torch.randn(shape)
+    got = _compile(model, x, tmp_path, target="nvptx", gpu_sm=sm, debug_dir=str(tmp_path / "dbg"))
+    torch.testing.assert_close(got, model(x), rtol=1e-4, atol=1e-5)
+    text = _host_ll(tmp_path / "dbg")
+    assert text.count("call i32 @cuMemcpyDtoH") == 1, "an intermediate result was copied back to the host"

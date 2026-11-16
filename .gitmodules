@@ -3,5 +3,5 @@
 	url = https://github.com/ScalingIntelligence/KernelBench
 [submodule "MimIR"]
 	path = MimIR
-	url = https://github.com/hsqStephenZhang/MimIR.git
+	url = https://github.com/HarithF/mimir.git
 branch = frontend-dev
